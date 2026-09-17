@@ -1,0 +1,67 @@
+{
+  "name": "dsh-notify-whale",
+  "version": "0.4.0",
+  "description": "DSH notifications that actually deliver: turn-outcome aware titles (完成 / 出错 / 已手动停止 / 被中断), wait-for-human alerts (审批 / 提问), per-event Bark sounds, and macOS/Windows/mobile push via Bark / ntfy / ServerChan / webhook. Hardened fork of dsh-task-notify.",
+  "type": "module",
+  "main": "index.mjs",
+  "exports": {
+    ".": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "config.mjs",
+    "dedupe.mjs",
+    "format.mjs",
+    "self-test.mjs",
+    "paths.mjs",
+    "menu.mjs",
+    "menu-core.mjs",
+    "scripts/install-smoke.mjs",
+    "scripts/install-smoke.sh",
+    "channels/",
+    "assets/",
+    "cordis.patch.yml",
+    "README.md",
+    "SPEC.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "check": "for f in *.mjs channels/*.mjs; do node --check \"$f\" || exit 1; done",
+    "test": "node --test *.test.mjs channels/*.test.mjs scripts/*.test.mjs",
+    "self-test": "node self-test.mjs",
+    "menu": "node menu.mjs",
+    "smoke": "bash scripts/install-smoke.sh",
+    "icons": "node scripts/build-icons.mjs"
+  },
+  "dependencies": {
+    "js-yaml": "^4.2.0"
+  },
+  "engines": {
+    "node": "^22.19.0 || >=24"
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "notification",
+    "task-completion",
+    "turn-outcome",
+    "bark",
+    "ntfy",
+    "plugin"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lon-dawn/dsh-notify-whale.git"
+  },
+  "homepage": "https://github.com/Lon-dawn/dsh-notify-whale#readme",
+  "bugs": {
+    "url": "https://github.com/Lon-dawn/dsh-notify-whale/issues"
+  }
+}
