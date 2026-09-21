@@ -1,6 +1,8 @@
-# dsh-notify-whale
+# 鲸吟 · dsh-notify-whale
 
 **DSH（DeepSeek Harness）通知插件**：会话结束时推手机，**卡在审批或提问等你操作时也推**。
+
+> 中文名 **鲸吟**；项目代号与 npm 包名均为 `dsh-notify-whale`。
 
 - macOS：系统通知中心（osascript，零依赖）
 - Windows：Toast 通知（PowerShell + WinRT，含 PNG 图标）
@@ -16,11 +18,19 @@
 >
 > 按 MIT 许可发布，**保留原作者版权声明**（见 [LICENSE](./LICENSE)）。
 
+> ### ⚙️ 本项目由 AI 主导修改
+>
+> 本仓库的**代码改动、测试与文档由 AI 编程代理完成**（跑在 DSH 上），人类负责决策、验收与发布。改动方向与取舍记录在提交信息与本文件中。
+>
+> 具体来说：上游只提供基础骨架——下面「修了什么」里的 **5 个 bug** 的定位与修复、**2 项新能力**的设计与实现、以及 **154 项测试**的补齐，都是 AI 在真实 DSH 上复现问题后改的。每一处修改都附**根因说明与实测证据**；拿不出证据的结论不会写进来（例如「上游在 Node 22/24 上 HTTP 通道完全发不出去」是实测复现的，不是读代码推测的）。
+>
+> 在上游与本 fork 之间选择时：本 fork 的价值在于**它是"真跑过"的版本**，而不是"功能更多"。
+
 ---
 
 ## 与上游的差异
 
-### 修掉的 4 个必现 bug
+### 修掉的 5 个必现 bug
 
 | # | 现象 | 根因与修法 |
 |---|---|---|
@@ -28,6 +38,7 @@
 | 2 | **所有** HTTP 通道（bark / ntfy / serverchan / webhook）静默发不出去 | `send()` 只把 `headers` / `body` 传给 `httpPost`，而后者是 `fetch(url, {...init})` —— **没有 method** → 变成「带 body 的 GET」→ undici 直接拒绝。→ 显式传 `method: "POST"` |
 | 3 | 正文永远取不到会话标题，只会显示兜底文案 | 插件读 `agent.session.events`，但 **DSH 的 `Session` 没有 `events` 属性**（运行时核对：`'events' in Session.prototype === false`）。公开 API 是**方法** `snapshotEvents()` → 守卫永不成立，取标题 / 取用户消息两条路径**从未执行过**。→ 改调 `snapshotEvents()`；兜底同时剥掉 `session-` 前缀并优先输出 `header.cwd` 的项目名 |
 | 4 | **任务出错、被手动停止也报「任务完成」** | 本版 DSH 的 `AgentStatus` 只有 `idle` / `running`——出错和手动停止时 agent 同样回到 `idle`，标题因此恒为「任务完成」。这是**误导性通知**，比不通知更糟。→ 新增 `latestTurnEndReason()` 读取最后一条 `turn/end` 的 reason，据此决定标题（时序已核对：`turn/end` 在 turn 的 `finally` 里 append，**早于** `agent/status: idle` 派发） |
+| 5 | 🐛 **某些活跃会话的「完成」通知被静默丢弃**（症状：只有「待回答」，从无「任务完成」） | `isRootAgent()` 拿 `session.header.parentSession` 当"子代理"标志。但它的真实语义是**上下文续接来源**——DSH 续接/派生上下文时会带上它，而这类会话 `delegationDepth` 仍为 0、`origin` 也不是 `subagent`，是**有真实人类交互的顶层会话**（实测对象：129 条人类提问、104 个回合，完成通知 0 条）。→ **删除该判据**。<br>安全性实测：本机 118 个会话中，`origin === 'subagent'` 与 `delegationDepth > 0` **完全等集（各 37 个）**，二者已是完整判据；删除后只放行 5 个「上下文续接」会话，**不含任何真子代理**，即该判据纯属误伤 |
 
 > 另修一处**仅影响测试**的上游问题：`paths.test.mjs` 写死了 `PACKAGE_DIR.endsWith('/')`，在 Windows 上必失败（`fileURLToPath` 在 Windows 返回以 `\` 结尾）。实现本身是对的，断言已改为跟随平台分隔符。上游全套测试在本 fork 中 **154 / 154 通过**（含上述断言改造后的 ntfy 传输测试）。
 

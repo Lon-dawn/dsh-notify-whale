@@ -28,7 +28,7 @@
  *    dsh-session-title 的 foldSessionTitle 就是折叠其中的 `session/title`
  *    事件（data.title）；无标题事件则取第一条 `user/message`
  *    （data.source.kind==='user'，data.content[].type==='text' 拼接）文本；
- *    两者皆无 → 降级文案（本 fork 修复 2026-09-14：先剥 `session-`
+ *    两者皆无 → 降级文案（本地补丁 win-steward 2026-09-14：先剥 `session-`
  *    前缀，原实现 slice(0,8) 恒等于 "session-"；并优先输出 header.cwd 的项目名，
  *    形如「dsh · ccf7916e」）。
  *    另注：Agent.id 本身就是 SessionId（Agent 接口声明 + dsh-session 的
@@ -191,7 +191,7 @@ export function apply(ctx, input = {}, overrides = {}) {
       const sessionId = safeId(agent) || String(agent.id);
       const ts = deps.now();
       const rawBody = deriveBody(agent, sessionId);
-      // 本 fork 修复（2026-09-14）：本版 AgentStatus 只有 idle|running，
+      // 本地补丁（win-steward，2026-09-14）：本版 AgentStatus 只有 idle|running，
       // 出错/被手动停止时 agent 同样回到 idle，原实现一律报「任务完成」——误导。
       // 真实结果在最后一次 turn/end 的 reason 里，据此决定标题与图标。
       const turnReason = latestTurnEndReason(agent);
@@ -227,7 +227,7 @@ export function apply(ctx, input = {}, overrides = {}) {
   });
 
   /* ------------------------------------------------------------------ */
-  /* 本 fork 修复（2026-09-17）：等待人工介入时也发通知            */
+  /* 本地补丁（win-steward，2026-09-17）：等待人工介入时也发通知            */
   /* ------------------------------------------------------------------ */
 
   /**
@@ -487,7 +487,7 @@ function safeId(agent) {
  *   3. 固定文案「会话 <前 8 位>」
  */
 export function deriveBody(agent, sessionId) {
-  // 本 fork 修复（2026-09-14）：DSH 的 Session **没有** `events` 属性。
+  // 本地补丁（win-steward，2026-09-14）：DSH 的 Session **没有** `events` 属性。
   // 运行时核对：`'events' in Session.prototype === false`、
   // `typeof Session.prototype.snapshotEvents === 'function'`。公开 API 是方法
   // snapshotEvents()。原实现读 agent.session.events 恒为 undefined，于是
@@ -527,7 +527,7 @@ export function deriveBody(agent, sessionId) {
       /* 日志形状异常 → 继续走降级文案 */
     }
   }
-  // 本 fork 修复（2026-09-14）：原实现是 `sessionId.slice(0, 8)`，
+  // 本地补丁（win-steward，2026-09-14）：原实现是 `sessionId.slice(0, 8)`，
   // 但 DSH 的 Agent.id/SessionId 带 `session-` 前缀（如 session-ccf7916e-…），
   // 因此 slice(0,8) 恒等于字符串 "session-"，降级文案永远是「会话 session-」，
   // 完全无法区分是哪个会话。改为：先剥掉前缀，并优先用会话 header 的 cwd
@@ -541,7 +541,7 @@ export function deriveBody(agent, sessionId) {
 }
 
 /**
- * 取会话最后一次 `turn/end` 的 reason（本 fork 修复 2026-09-14）。
+ * 取会话最后一次 `turn/end` 的 reason（本地补丁，win-steward 2026-09-14）。
  *
  * 用途：`AgentStatus` 只有 idle/running，任务出错或被手动停止时 agent 同样回到
  * idle，无法据此区分结果；真实结果只在 `turn/end` 的 `data.reason` 里
@@ -603,7 +603,17 @@ export function isRootAgent(agent) {
     const runtimeDepth = toFiniteNumber(agent?.options?.subagentDepth);
     const depth = Math.max(headerDepth ?? 0, runtimeDepth ?? 0);
     if (depth > 0) return false;
-    if (agent?.session?.header?.parentSession != null) return false;
+    // 本 fork 修复（2026-09-22）：**已删除 parentSession 判据**。
+    //
+    // parentSession 的语义是「上下文续接来源」，不是「子代理」：DSH 在续接/派生
+    // 会话时会带上它，但这类会话的 delegationDepth 仍为 0、origin 也不是
+    // 'subagent' —— 它们是有真实人类交互的**活跃顶层会话**（实测某会话 129 条
+    // 人类提问、104 个回合），却被这里误判为子代理 → **完成通知被静默丢弃**，
+    // 而等待类通知不受此判据限制，于是表现为「只有『待回答』没有『任务完成』」。
+    //
+    // 实测依据（本机 118 个会话）：origin === 'subagent' 与 delegationDepth > 0
+    // **完全等集（各 37 个）**；去掉 parentSession 只会放行 5 个「上下文续接」
+    // 会话，其中**不含任何真子代理**，因此该判据是纯误伤，删除是安全的。
     if (agent?.session?.header?.origin === 'subagent') return false;
     return true;
   } catch {

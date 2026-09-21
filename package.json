@@ -1,7 +1,7 @@
 {
   "name": "dsh-notify-whale",
-  "version": "0.4.0",
-  "description": "DSH notifications that actually deliver: turn-outcome aware titles (完成 / 出错 / 已手动停止 / 被中断), wait-for-human alerts (审批 / 提问), per-event Bark sounds, and macOS/Windows/mobile push via Bark / ntfy / ServerChan / webhook. Hardened fork of dsh-task-notify.",
+  "version": "0.4.1",
+  "description": "鲸吟（dsh-notify-whale）：DSH 通知插件加固 fork。修复上游在 Node 22/24 上 HTTP 通道完全无法投递等 5 个必现 bug；新增「等待审批/提问也通知」与事件级 Bark 铃声。AI 主导修改。(Hardened fork of dsh-task-notify.)",
   "type": "module",
   "main": "index.mjs",
   "exports": {

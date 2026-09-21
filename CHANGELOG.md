@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.4.1 — 鲸吟
+
+- **修（真 bug）**：`isRootAgent()` 误用 `session.header.parentSession` 当"子代理"标志。它是**上下文续接来源**，不是子代理标记——续接而来的会话 `delegationDepth` 仍为 0、`origin` 也不是 `subagent`，因而被误判 → **完成通知被静默丢弃**，症状是"只有『待回答』、从无『任务完成』"。已删除该判据（实测：118 个会话中 `origin === 'subagent'` 与 `delegationDepth > 0` 完全等集，删除后不放行任何真子代理）。
+- 项目中文名定为 **鲸吟**（包名不变，仍为 `dsh-notify-whale`）。
+- README 增加「本项目由 AI 主导修改」披露。
+
+## 0.4.0
+
+加固 fork 首个版本。修复上游在 Node 22 / 24 上的 4 个必现 bug，新增 2 项能力：
+
+- **修**：ntfy 中文标题抛 `ByteString`（`X-Title` 头只允许 Latin-1）→ 改用官方 JSON 发布。
+- **修**：所有 HTTP 通道静默失败（`fetch` 缺 `method`，退化为带 body 的 GET）→ 显式 POST。
+- **修**：正文永远取不到会话标题（读了不存在的 `Session.events`）→ 改用 `snapshotEvents()`。
+- **修**：出错 / 手动停止都报「任务完成」（`AgentStatus` 只有 `idle|running`）→ 读 `turn/end` 的 reason 决定标题。
+- **新增**：等待人工介入也通知（`approval/asked` / `ask_user_question`），走 `session/event` 而非 waterfall（后者会被上游抢先认领，第三方插件收不到）。
+- **新增**：事件级 Bark 铃声（`bark.sounds` 映射）。
+- **修（测试）**：上游 `paths.test.mjs` 的 `PACKAGE_DIR.endsWith('/')` 在 Windows 上必失败 → 改为跟随平台分隔符。
+- 全套测试 154 / 154 通过。
+
 ## 0.3.0
 
 - 通知排版：正文尾部追加本地时间和耗时后缀（format.time 取 hidden | short | full，format.showDuration 控制是否展示用时）。composeBody 保证时间后缀不被正文截断。
