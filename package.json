@@ -1,7 +1,7 @@
 {
   "name": "dsh-notify-whale",
-  "version": "0.4.2",
-  "description": "椴稿悷锛坉sh-notify-whale锛夛細DSH 閫氱煡鎻掍欢鍔犲浐 fork銆備慨澶嶄笂娓稿湪 Node 22/24 涓?HTTP 閫氶亾瀹屽叏鏃犳硶鎶曢€掔瓑 5 涓繀鐜?bug锛涙柊澧炪€岀瓑寰呭鎵?鎻愰棶涔熼€氱煡銆嶄笌浜嬩欢绾?Bark 閾冨０銆侫I 涓诲淇敼銆?Hardened fork of dsh-task-notify.)",
+  "version": "0.4.3",
+  "description": "鲸吟（dsh-notify-whale）：DSH 通知插件加固 fork。修复上游在 Node 22/24 上 HTTP 通道完全无法投递等 5 个必现 bug；新增「等待审批/提问也通知」与事件级 Bark 铃声。AI 主导修改。(Hardened fork of dsh-task-notify.)",
   "type": "module",
   "main": "index.mjs",
   "exports": {
