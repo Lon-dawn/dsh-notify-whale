@@ -1,9 +1,20 @@
+# The plugin row carries the id `task-notify` — deliberately.
+#
+# 0.1.7's settings import and its per-entry forms both address a plugin by its
+# Loader entry id, and the legacy `settings.yaml` section is literally named
+# `task-notify`. Keeping the runtime row on that id means the section resolves
+# to the row that actually owns the config, instead of landing on the group
+# shell (which has no schema and therefore is not configurable).
+#
+# The group keeps the isolate realm the plugin has always run in; only its id
+# moved aside. `applyEntryPatches` recurses into `entry.config` for grouped rows
+# (dsh-app-boot `buildMap`), so id-targeted overrides still reach the child.
 - insert:
-    - id: task-notify
+    - id: task-notify-group
       name: '@deepseek-ai/cordis-plugin-group'
       group: true
       isolate:
         taskNotify: true
       config:
-        - id: task-notify-runtime
+        - id: task-notify
           name: dsh-notify-whale

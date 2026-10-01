@@ -53,10 +53,20 @@
  */
 
 import { execFile } from 'node:child_process';
-import { resolveConfig } from './config.mjs';
+import { resolveConfig, isPlainObject } from './config.mjs';
 import { createCoalescer } from './dedupe.mjs';
+import { Config } from './config-schema.mjs';
 
 export const name = 'task-notify';
+
+/**
+ * 0.1.7 settings schema. `@deepseek-ai/dsh-settings` treats an entry as
+ * configurable only when `entry.fiber.runtime.Config` exists and carries at
+ * least one volatile field; the volatile ones are handed to {@link apply} as
+ * live references and hot-committed by the Loader, which then emits
+ * `loader/volatile-update`.
+ */
+export { Config };
 
 /**
  * 服务注入列表。研究结论（见文件头第 3 点）：标题/最近用户输入可直接从
@@ -114,12 +124,55 @@ function isFormatModule(mod) {
  *   deps/format。第三个参数对 cordis 不可见，不影响生产契约（registry.plugin 只传两参）。
  */
 export function apply(ctx, input = {}, overrides = {}) {
+  /**
+   * Build the effective config from the row's config.
+   *
+   * Under 0.1.7 a config that declares a `Config` schema arrives with volatile
+   * fields materialised as live references (`{ get(), [write]() }`) — see
+   * `dsh-settings`/`cosmokit`. Two consequences drive this function:
+   *
+   *  1. The references must be unwrapped before `resolveConfig` sees them, or
+   *     every channel section would be "not a plain object" and silently
+   *     ignored.
+   *  2. A schema fills in ALL defaults, so passing it straight through would
+   *     bury the env layer beneath it. `Config.simplify()` returns only the
+   *     fields the user actually set (null when none), which is exactly the
+   *     patch-layer semantics the merge already implements.
+   *
+   * The test seam (`overrides.config`) and a schema-less mount both keep the
+   * historical behaviour.
+   */
+  const buildConfig = () => {
+    if (overrides.config !== undefined) return overrides.config;
+    let raw = input;
+    if (Config !== undefined && isPlainObject(input)) {
+      // A volatile reference is an opaque object, not a plain config section.
+      // Unwrap first so `simplify` sees real data, then re-derive.
+      const deref = (value) => {
+        if (value !== null && typeof value === 'object' && typeof value.get === 'function') return deref(value.get());
+        if (Array.isArray(value)) return value.map(deref);
+        if (isPlainObject(value)) {
+          const out = {};
+          for (const key of Object.keys(value)) out[key] = deref(value[key]);
+          return out;
+        }
+        return value;
+      };
+      const plain = deref(input);
+      const simplified = Config.simplify(plain);
+      // A row whose config was purely defaults has nothing to merge; the
+      // built-in defaults, env layer and settings.yaml layer still apply.
+      raw = simplified === null ? {} : simplified;
+    }
+    return resolveConfig(raw);
+  };
+
   let config;
   try {
     // @internal 测试缝：overrides.config 直接给定已解析配置，跳过三层合并
     // （否则单测会读到开发机真实的 ~/.dsh/settings.yaml，结果随环境漂移）。
     // 生产路径 cordis 只传两参，overrides 恒为 {}。
-    config = overrides.config ?? resolveConfig(input);
+    config = buildConfig();
   } catch (error) {
     // resolveConfig 设计上不抛；此分支是最后防线：配置坏了就整体静默停用。
     console.warn('[task-notify] 配置解析异常，插件已停用:', error);
@@ -151,6 +204,26 @@ export function apply(ctx, input = {}, overrides = {}) {
     if (channelsReady === null) channelsReady = acquireChannels(config, deps, overrides, logger);
     return channelsReady;
   };
+
+  /**
+   * 0.1.7 热更新：设置页改的是 Config 里的 volatile 字段，Loader 会**原地提交**到
+   * 那些引用上，然后广播 `loader/volatile-update`——行本身不会被重新 mount。
+   * 所以这里必须自己重解析配置并丢弃已建好的通道，否则手机端的服务器/铃声
+   * 要等重启才生效。
+   */
+  if (typeof ctx.on === 'function') {
+    ctx.on('loader/volatile-update', () => {
+      try {
+        const next = buildConfig();
+        config = next;
+        // 通道是按旧配置构造的（url/headers/凭据都在闭包里），必须重建。
+        channelsReady = null;
+        logger.info('[task-notify] 配置已热更新，通道已重建');
+      } catch (error) {
+        logger.warn(`[task-notify] 热更新配置失败，沿用旧配置：${describe(error)}`);
+      }
+    });
+  }
 
   const coalescer = createCoalescer(
     config.coalesceWindowMs,
@@ -210,9 +283,9 @@ export function apply(ctx, input = {}, overrides = {}) {
         : format.formatBody(rawBody, config.maxBodyLength);
       const notification = {
         event: titleEvent,
-        title: typeof format.formatTurnTitle === 'function'
+        title: applyTitleOverride(config.titles, titleEvent, typeof format.formatTurnTitle === 'function'
           ? format.formatTurnTitle(turnReason)
-          : format.formatTitle(status),
+          : format.formatTitle(status)),
         body,
         sessionId,
         agentId: safeId(agent), // 研究：Agent.id 即 SessionId（恒等 brand），二者相同
@@ -280,7 +353,7 @@ export function apply(ctx, input = {}, overrides = {}) {
       coalescer.push(sessionId, () =>
         dispatch({
           event: eventName,
-          title: format.formatTitle(eventName),
+          title: applyTitleOverride(config.titles, eventName, format.formatTitle(eventName)),
           body,
           sessionId,
           agentId: sessionId,
@@ -450,6 +523,29 @@ async function acquireChannels(config, deps, overrides, logger) {
 /* ------------------------------------------------------------------ */
 /* Payload 辅助                                                        */
 /* ------------------------------------------------------------------ */
+
+/**
+ * 用设置里的自定义标题覆盖内置文案。
+ *
+ * 内置标题仍由 `format.mjs` 提供（`TITLE_BY_EVENT` / `TITLE_BY_TURN_END`），
+ * 这里只做一层覆盖：`config.titles[event]` 非空则用它，否则原样返回内置标题。
+ * 因此「不配置」= 与历史行为逐字一致，配置了才改名。
+ *
+ * 对未归一化的 config（单测直接传入的配置）保持宽容：titles 缺失/非对象
+ * 一律视为未配置。
+ *
+ * @param {Record<string, string>|undefined} titles 配置的 titles 段
+ * @param {string} event 事件名（与图标、bark.sounds 用同一套名字）
+ * @param {string} fallback format.mjs 给出的内置标题
+ * @returns {string} 最终标题
+ */
+export function applyTitleOverride(titles, event, fallback) {
+  if (!titles || typeof titles !== 'object') return fallback;
+  const custom = titles[event];
+  if (typeof custom !== 'string') return fallback;
+  const trimmed = custom.trim();
+  return trimmed === '' ? fallback : trimmed;
+}
 
 /**
  * 渲染远程图标 URL（SPEC §7.3/§7.4）。

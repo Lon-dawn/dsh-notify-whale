@@ -1,14 +1,18 @@
 {
   "name": "dsh-notify-whale",
-  "version": "0.4.3",
+  "version": "0.5.0",
   "description": "鲸吟（dsh-notify-whale）：DSH 通知插件加固 fork。修复上游在 Node 22/24 上 HTTP 通道完全无法投递等 5 个必现 bug；新增「等待审批/提问也通知」与事件级 Bark 铃声。AI 主导修改。(Hardened fork of dsh-task-notify.)",
   "type": "module",
   "main": "index.mjs",
   "exports": {
-    ".": "./index.mjs"
+    ".": "./index.mjs",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
   },
   "files": [
     "index.mjs",
+    "config-schema.mjs",
+    "client.js",
     "config.mjs",
     "dedupe.mjs",
     "format.mjs",
@@ -27,17 +31,25 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
     }
   },
   "scripts": {
-    "check": "for f in *.mjs channels/*.mjs; do node --check \"$f\" || exit 1; done",
+    "check": "for f in *.mjs *.js channels/*.mjs; do node --check \"$f\" || exit 1; done",
     "test": "node --test *.test.mjs channels/*.test.mjs scripts/*.test.mjs",
     "self-test": "node self-test.mjs",
     "menu": "node menu.mjs",
     "smoke": "bash scripts/install-smoke.sh",
-    "icons": "node scripts/build-icons.mjs"
+    "icons": "node scripts/build-icons.mjs",
+    "test:client": "node client.verify.mjs && node css.verify.mjs && node titles.verify.mjs && node bark-group.verify.mjs"
   },
   "dependencies": {
+    "@deepseek-ai/schemastery": "^3.18.4",
     "js-yaml": "^4.2.0"
   },
   "engines": {
@@ -53,7 +65,9 @@
     "turn-outcome",
     "bark",
     "ntfy",
-    "plugin"
+    "plugin",
+    "settings",
+    "notification-group"
   ],
   "license": "MIT",
   "repository": {

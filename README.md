@@ -57,6 +57,24 @@
 
 **6. 事件级铃声**（仅 Bark 支持自定义铃声；`sound` 为全局默认，`sounds` 按事件覆盖）
 
+**7. 原生设置页（DSH 0.1.7+）**
+
+侧边栏出现一级菜单「**通知**」，全部配置可在界面里改，**保存后立即生效、无需重启**。
+
+> 0.1.7 起 `$DSH_HOME/settings.yaml` 已被上游删除（启动时改名 `settings.yaml.imported`），插件配置改由 **profile 的 `cordis.patch.yml`** 承载。本 fork 为此补上了 0.1.7 的设置面接入：Host 侧导出 `Config` schema（字段标 `.volatile()`），Client 侧新增浏览器半区注册 `settings.section`。
+>
+> ⚠️ 0.1.7 **不会**根据 `Config` 自动生成设置页——上游 `dsh-settings` 只上报 `autoGenerate` 标记，而「目前没有已发布的客户端这样做」。所以设置页必须由插件自带浏览器半区，这也是本 fork 新增 `client.js` 的原因。
+
+**8. 推送分组（Bark `group`）**
+
+多台机器共用一个自建 Bark 服务器时，不指定 `group` 会让所有推送挤进 App 的「默认」分组，**历史记录里分不出是哪台机器**。
+
+本 fork 的默认值取**本机主机名**（截断到 Bark 建议的 8 字符），因此每台机器**开箱即分开、零配置**；想自定义（如 `PC2`/`RG`）在设置页填一个非空值即可覆盖。
+
+**9. 通知标题可改**
+
+9 个事件的标题都能在设置页里改（如把「需要确认」改成「待我拍板」）。留空＝沿用内置文案，所以不配置与历史行为逐字一致。覆盖作用于**所有通道**，不只是 Bark。
+
 ---
 
 ## 通知对照表
@@ -73,7 +91,7 @@
 | 等待选择 / 回答 | 待回答 | `awaiting-answer` | horn | 灰点 |
 | 未知 / 取不到 | 任务完成 | `idle` | fanfare | 绿勾 |
 
-正文格式：`<会话标题或项目名> · <具体事由> · HH:mm`。
+正文格式：`<会话标题或项目名> · <具体事由> · HH:mm`。标题与铃声均可在设置页覆盖。
 
 ---
 
@@ -83,9 +101,9 @@
 dsh plugin --profile web add dsh-notify-whale
 ```
 
-装完 **重启 DSH**（插件在 boot 时读一次配置，**改配置后同样必须重启**）。
+装完 **重启 DSH**。之后改配置在设置页里改，**立即生效、不用再重启**。
 
-从本地目录安装：`dsh plugin --profile web add /path/to/dsh-notify-whale`。此时 pnpm 以 `link:` 方式接入、**不会**给被链接目录装依赖，需在插件目录里单独执行一次 `npm install --omit=dev`（否则报 `ERR_MODULE_NOT_FOUND: js-yaml`）。用 npm 安装没有这个问题。
+从本地目录安装：`dsh plugin --profile web add /path/to/dsh-notify-whale`。此时 pnpm 以 `link:` 方式接入、**不会**给被链接目录装依赖，需在插件目录里单独执行一次 `npm install --omit=dev`（否则报 `ERR_MODULE_NOT_FOUND: js-yaml` 或 `@deepseek-ai/schemastery`）。用 npm 安装没有这个问题。
 
 > 若 pnpm 报 `minimumReleaseAge` 供应链策略拦截（v11 内置默认），命令末尾追加 `--config.minimum-release-age=0` 按次放行。
 
@@ -93,49 +111,58 @@ dsh plugin --profile web add dsh-notify-whale
 
 ## 配置
 
-写入 `$DSH_HOME/settings.yaml` 的 `task-notify:` 段：
+**推荐：在侧边栏「通知」设置页里改**（DSH 0.1.7+）。改动写入 profile 的 `cordis.patch.yml`，保存即生效。
+
+也可以直接写 profile patch：
 
 ```yaml
-task-notify:
-  enabled: true
-  notifyOn: [idle, error, blocked]   # blocked 供等待类通知复用
-  agents: root                       # root=只通知顶层会话 | all；等待类通知不受此项限制
-  coalesceWindowMs: 2000             # 同会话窗口内合并重复通知
-  desktop:
-    enabled: off                     # auto | on | off（注意：写 false 会警告并回退为 auto）
-    sound: true
-  format:
-    time: short                      # hidden | short | full —— 正文尾部时间样式
-    showDuration: true               # 负载携带 durationMs 时追加「用时 X」
-  icons:
-    enabled: true                    # 图形图标总开关
-    urlTemplate: ""                  # 远程图标 URL 模板；含 {event} 则按事件取图，如 https://host/icons/{event}.png
-  ntfy:
+- id: task-notify
+  name: dsh-notify-whale
+  config:
     enabled: true
-    server: https://ntfy.sh
-    topic: "你的随机主题名"           # 公共服务器上 topic 就是密码，别用可猜的名字
-    token: ""                        # 自建实例需要鉴权时填
-  bark:
-    enabled: true
-    server: https://api.day.app
-    deviceKey: "你的BarkKey"
-    sound: "fanfare"
-    sounds:
-      error: calypso
-      stopped: bell
-      interrupted: bloom
-      awaiting-approval: horn
-      awaiting-answer: horn
-  serverchan:
-    enabled: false
-    sendKey: ""
-  webhook:
-    enabled: false
-    url: ""
-    headers: {}
+    notifyOn: [idle, error, blocked]   # blocked 供等待类通知复用
+    agents: root                       # root=只通知顶层会话 | all；等待类通知不受此项限制
+    coalesceWindowMs: 2000             # 同会话窗口内合并重复通知
+    desktop:
+      enabled: off                     # auto | on | off
+      sound: true
+    format:
+      time: short                      # hidden | short | full —— 正文尾部时间样式
+      showDuration: true               # 负载携带 durationMs 时追加「用时 X」
+    titles:                            # 通知标题覆盖；留空＝内置文案
+      blocked: "待我拍板"
+    icons:
+      enabled: true                    # 图形图标总开关
+      urlTemplate: ""                  # 远程图标 URL 模板；含 {event} 则按事件取图
+    ntfy:
+      enabled: true
+      server: https://ntfy.sh
+      topic: "你的随机主题名"           # 公共服务器上 topic 就是密码，别用可猜的名字
+      token: ""                        # 自建实例需要鉴权时填
+    bark:
+      enabled: true
+      server: https://api.day.app
+      deviceKey: "你的BarkKey"
+      group: ""                        # 推送分组；留空＝自动用本机主机名（≤8 字符）
+      sound: "fanfare"
+      sounds:
+        error: calypso
+        stopped: bell
+        interrupted: bloom
+        awaiting-approval: horn
+        awaiting-answer: horn
+    serverchan:
+      enabled: false
+      sendKey: ""
+    webhook:
+      enabled: false
+      url: ""
+      headers: {}
 ```
 
-配置优先级：cordis patch 显式传参 > `settings.yaml` > 环境变量（`DSH_TASK_NOTIFY_*`）> 内置默认。
+配置优先级：cordis patch 显式传参 > 环境变量（`DSH_TASK_NOTIFY_*`）> 内置默认。
+
+> ⚠️ 0.1.7 起 `settings.yaml` 这一层**已不存在**（文件被上游改名并一次性导入）。旧文档里写的「写入 `settings.yaml` 的 `task-notify:` 段」只适用于 0.1.6 及更早。
 
 架构与事件契约详见 [SPEC.md](./SPEC.md)。
 
@@ -144,9 +171,20 @@ task-notify:
 ## 验证
 
 ```bash
+npm test                               # 单元测试（153 项）
+npm run test:client                    # 设置页与配置的 4 项守卫
 node self-test.mjs                     # 向全部启用通道发一条样例通知
 node self-test.mjs --channel ntfy      # 只测单个通道
 ```
+
+`npm run test:client` 覆盖的是靠肉眼容易漏、且改坏了不会报错的几处：
+
+| 守卫 | 防的是什么 |
+|---|---|
+| `client.verify.mjs` | 设置页在 loading / unavailable / ready 三态下都能渲染，且 slot 注册形状正确 |
+| `css.verify.mjs` | CSS 模板里混进反引号或 `${` 会**静默截断整个模块**；并校验引用的每个主题令牌真实存在 |
+| `titles.verify.mjs` | 标题覆盖的「留空＝沿用内置」语义 |
+| `bark-group.verify.mjs` | 分组默认取本机名、显式值原样尊重、且真的进了请求体 |
 
 成功时**静默**（只有非 2xx 才 warn）。想确认服务端真的收到，从服务端反查：
 
@@ -168,7 +206,9 @@ npm run menu
 - **自建 ntfy 若开了 `deny-all`**，手机端（ntfy App）必须配置访问凭据，否则订阅被 403 拒掉、表现为一直「Reconnecting」。
 - 自建服务端请用**域名**而非 IP：家用宽带 IPv6 前缀会变。
 - Bark 自定义铃声**仅 iOS**；ntfy 的铃声只能在手机 App 侧设置（其发布协议没有 sound 参数）。
-- `self-test.mjs` 是**独立进程**、读磁盘最新配置。它通过**不**代表运行中的 DSH 宿主进程已加载新配置——改完配置必须重启，并用一次真实事件验证。
+- Bark 的 `group` **仅 iOS App 的历史记录分组**用得到；Android 客户端与 ntfy 没有对应概念，填了不影响投递。
+- **设置页需要 DSH 0.1.7+**：它依赖 0.1.7 的 `Config`/`settings.section` 接口。更早的版本装本插件仍可正常通知，只是看不到设置页，需要手写 patch 配置。
+- `self-test.mjs` 是**独立进程**、读磁盘最新配置。它通过**不**代表运行中的 DSH 宿主进程已加载新配置——设置页之外的改动（直接编辑 patch）需重启后验证。
 
 ---
 

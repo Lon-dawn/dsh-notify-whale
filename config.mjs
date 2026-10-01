@@ -18,12 +18,36 @@
  */
 
 import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { join, isAbsolute } from 'node:path';
 import yaml from 'js-yaml';
 
 /** 默认 settings.yaml 路径。 */
 export const DEFAULT_SETTINGS_PATH = join(homedir(), '.dsh', 'settings.yaml');
+
+/**
+ * Bark 推送分组（`group` 参数）的默认值：本机主机名。
+ *
+ * 为什么默认是机器名而不是空：多台机器（PC2 / A7U / PC1）常常共用同一个自建
+ * Bark 服务器，`group` 不指定时所有推送都落进 App 的「默认」分组，历史记录里
+ * 三台机器混在一起无法区分。用主机名做默认值，各机器**开箱即分开**，用户不必
+ * 逐台配置；想自己命名时在设置里填一个非空值即可覆盖。
+ *
+ * 为什么要截断：Bark 文档建议分组名不超过 8 个字符，过长会被通知中心截断显示。
+ * 主机名取不到（极少数平台/受限环境）时回退到固定名，绝不产生空分组。
+ *
+ * @returns {string} 分组名（非空，≤ 8 字符）
+ */
+export function defaultBarkGroup() {
+  let name = '';
+  try {
+    name = String(hostname() ?? '').trim();
+  } catch {
+    name = '';
+  }
+  if (name === '') return 'dsh';
+  return name.length > 8 ? name.slice(0, 8) : name;
+}
 
 /** 内置默认值（SPEC 5.3 schema）。深拷贝后作为合并基底，绝不直接暴露可变引用。 */
 export function defaultConfig() {
@@ -37,7 +61,7 @@ export function defaultConfig() {
     // 本 fork 修复（2026-09-17）：sounds 为「事件名 → 铃声名」映射，
     // 用于让等待类事件（awaiting-approval / awaiting-answer）响不同的铃声。
     // 未命中映射的事件回退 sound。对象值，由 normalizeSounds 单独处理。
-    bark: { enabled: false, server: 'https://api.day.app', deviceKey: '', sound: '', sounds: {} },
+    bark: { enabled: false, server: 'https://api.day.app', deviceKey: '', sound: '', sounds: {}, group: '' },
     ntfy: { enabled: false, server: 'https://ntfy.sh', topic: '', token: '' },
     serverchan: { enabled: false, sendKey: '' },
     webhook: { enabled: false, url: '', headers: {} },
@@ -47,22 +71,32 @@ export function defaultConfig() {
     // v0.3：通知排版。time 控制正文尾部时间样式（hidden | short | full），
     // showDuration 在 payload 带 durationMs 时追加 "用时 X" 后缀。
     format: { time: 'short', showDuration: true },
+    // 通知标题覆盖层：事件名 → 自定义标题；空映射＝全部用 format.mjs 的内置文案。
+    titles: {},
   };
 }
+
+/** 通知标题可覆盖的事件名（留空则用 format.mjs 的内置标题）。 */
+export const TITLE_EVENTS = Object.freeze([
+  'idle', 'error', 'blocked', 'goal-completed',
+  'stopped', 'interrupted', 'truncated',
+  'awaiting-approval', 'awaiting-answer',
+]);
 
 /** 各层级允许出现的键（未知键忽略 + warn）。通道段内部键单独校验。 */
 const KNOWN_TOP_KEYS = new Set([
   'enabled', 'notifyOn', 'agents', 'coalesceWindowMs', 'maxBodyLength',
-  'desktop', 'bark', 'ntfy', 'serverchan', 'webhook', 'icons', 'format',
+  'desktop', 'bark', 'ntfy', 'serverchan', 'webhook', 'icons', 'format', 'titles',
 ]);
 const KNOWN_SECTION_KEYS = {
   desktop: new Set(['enabled', 'sound']),
-  bark: new Set(['enabled', 'server', 'deviceKey', 'sound', 'sounds']),
+  bark: new Set(['enabled', 'server', 'deviceKey', 'sound', 'sounds', 'group']),
   ntfy: new Set(['enabled', 'server', 'topic', 'token']),
   serverchan: new Set(['enabled', 'sendKey']),
   webhook: new Set(['enabled', 'url', 'headers']),
   icons: new Set(['enabled', 'urlTemplate']),
   format: new Set(['time', 'showDuration']),
+  titles: new Set(TITLE_EVENTS),
 };
 
 /**
@@ -262,6 +296,14 @@ function normalizeInPlace(cfg, warn) {
   });
   // 本 fork 修复（2026-09-17）：事件级铃声映射（对象值，同 headers 的处理方式）
   cfg.bark.sounds = normalizeSounds(cfg.bark.sounds, warn);
+  // Bark 分组：未配置（空/缺失）时用本机主机名，这样多台机器共用一个自建
+  // 服务器也能自动分开；显式配了非空值就尊重用户的选择。
+  if (cfg.bark.group === '' || cfg.bark.group === undefined || cfg.bark.group === null) {
+    cfg.bark.group = defaultBarkGroup();
+  } else {
+    const group = withFallback(coerceTrimmedString(cfg.bark.group), defaultBarkGroup(), 'bark.group', warn);
+    cfg.bark.group = group === '' ? defaultBarkGroup() : group;
+  }
   cfg.ntfy = normalizeChannel(cfg.ntfy, KNOWN_SECTION_KEYS.ntfy, 'ntfy', warn, {
     server: 'https://ntfy.sh',
   });
@@ -290,6 +332,39 @@ function normalizeInPlace(cfg, warn) {
   }
   cfg.format.time = withFallback(coerceTimeStyle(cfg.format.time), 'short', 'format.time', warn);
   cfg.format.showDuration = withFallback(coerceBool(cfg.format.showDuration), true, 'format.showDuration', warn);
+
+  // 通知标题覆盖层：事件名 → 自定义标题。空值表示「用内置标题」，因此这里
+  // 只保留非空字符串；未知事件名丢弃，避免拼错的事件名静默生效。
+  cfg.titles = normalizeTitles(cfg.titles, warn);
+}
+
+/**
+ * bark.sounds 同族：把「事件名 → 自定义标题」归一化为紧凑映射。
+ *
+ * @param {unknown} titles 原始配置值
+ * @param {(msg: string) => void} warn 警告收集回调
+ * @returns {Record<string, string>} 只含非空标题的映射
+ */
+function normalizeTitles(titles, warn) {
+  if (titles === undefined || titles === null || titles === '') return {};
+  if (!isPlainObject(titles)) {
+    warn('titles 必须是「事件名 → 标题」映射，已忽略');
+    return {};
+  }
+  const known = new Set(TITLE_EVENTS);
+  const out = {};
+  for (const [rawKey, rawValue] of Object.entries(titles)) {
+    const key = withFallback(coerceTrimmedString(rawKey), '', 'titles 的键', warn);
+    if (key === '') continue;
+    if (!known.has(key)) {
+      warn(`titles 含未知事件名 "${key}"，已忽略`);
+      continue;
+    }
+    const value = withFallback(coerceTrimmedString(rawValue), '', `titles.${key}`, warn);
+    // 空标题＝不覆盖，回落到 format.mjs 的内置文案。
+    if (value !== '') out[key] = value;
+  }
+  return out;
 }
 
 function normalizeChannel(section, knownKeys, name, warn, stringDefaults = {}) {
@@ -419,7 +494,14 @@ function coerceHeadersJson(v) {
 /* 小工具                                                              */
 /* ------------------------------------------------------------------ */
 
-function isPlainObject(v) {
+/**
+ * 宽松的「对象」判定：任何非数组的非 null 对象都算。
+ *
+ * ⚠️ 注意它**也会把 schemastery 的 volatile 引用对象**（`{get, [write]}`）判为对象——
+ * 那是 0.1.7 的 Config 把字段 materialize 成引用的结果，调用方若拿到原始 config
+ * 必须先解包（见 index.mjs 的 buildConfig），否则整段会被当成「普通配置」处理。
+ */
+export function isPlainObject(v) {
   return v !== null && typeof v === 'object' && !Array.isArray(v);
 }
 function typeName(v) {

@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0 — 原生设置页
+
+**新增：侧边栏一级菜单「通知」**（DSH 0.1.7+），全部配置可在界面里改，**保存立即生效、无需重启**。
+
+- **新增（Host）**：导出 `Config` schema（`@deepseek-ai/schemastery`，字段标 `.volatile()`），使本行成为 0.1.7 认可的「可配置 entry」；监听 `loader/volatile-update` 重建通道，实现热更新。
+- **新增（Client）**：`client.js` 浏览器半区，注册 `settings.section` 一级设置页。
+  > ⚠️ 0.1.7 **不会**按 `Config` 自动生成设置页——上游 `dsh-settings` 只上报 `autoGenerate` 标记，且明言「目前没有已发布的客户端这样做」。设置页必须由插件自带浏览器半区。
+- **修（0.1.7 破坏性变更）**：0.1.7 删除了 `$DSH_HOME/settings.yaml`（启动时改名 `settings.yaml.imported`）并**一次性导入**各 section 到同名 entry。本插件的 section 名为 `task-notify`，而当时插件行 id 是 `task-notify-runtime`、且未导出 `Config`，于是导入报 `No configurable plugin entry` 并**静默丢弃整个 section** → 用户配置全部回退内置默认（表现为 Bark/ntfy 推送失效、桌面通知反而被打开）。
+  现已把插件行 id 对齐为 `task-notify`（分组壳让位为 `task-notify-group`），section 名与 entry id 一致。
+- **新增：Bark 推送分组**（`bark.group`）。多台机器共用一个自建服务器时，不指定分组会让所有推送挤进 App 的「默认」分组、历史记录里分不出机器。默认值取**本机主机名**（截断到 Bark 建议的 8 字符），各机开箱即分开、零配置；填非空值即覆盖。走 JSON body 而非 URL 查询串，空格与中文不会被转义坏。
+- **新增：通知标题可改**（`titles.<event>`，9 个事件）。留空＝沿用内置文案，因此不配置与历史行为逐字一致。覆盖作用于**所有通道**，不只是 Bark。
+- **新增 4 项守卫脚本**（`npm run test:client`）：设置页三态渲染、CSS 模板完整性 + 主题令牌存在性、标题覆盖语义、分组默认与请求体。这几处改坏了不会报错，只能靠断言拦。
+- 全量测试 153/153 通过。
+
 ## 0.4.3
 
 - **修（编码损坏）**：0.4.2 用 PowerShell 的 `Get-Content -Raw` + `-replace` + `WriteAllText` 改写 `package.json`，而 PowerShell 默认按 **ANSI** 解码，导致 `description` 里的中文（鲸吟）在读取那一刻就被损坏、再写回固化为乱码。

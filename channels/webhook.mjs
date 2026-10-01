@@ -76,11 +76,16 @@ function pickBarkSound(cfg, event) {
 }
 
 /**
- * Bark: JSON `{title, body, sound?}` against `https://<server>/<deviceKey>`.
+ * Bark: JSON `{title, body, sound?, group?}` against `https://<server>/<deviceKey>`.
  * A non-empty `payload.iconUrl` is appended as an `icon` query parameter
  * (SPEC §7.4) — Bark reads query params alongside the JSON body.
  *
- * @param {{ server?: string, deviceKey?: string, sound?: string, sounds?: Record<string, string> }} cfg
+ * `group` is Bark's notification-group key: the iOS app files pushes under it in
+ * 历史消息, and without it every machine sharing one server lands in the same
+ * "默认" bucket. It rides in the JSON body (Bark accepts a body key just like the
+ * URL query), so a group name containing spaces or CJK stays safe.
+ *
+ * @param {{ server?: string, deviceKey?: string, sound?: string, sounds?: Record<string, string>, group?: string }} cfg
  * @param {{ event?: string, title: string, body: string, iconUrl?: string }} payload
  * @returns {{ url: string, headers: object, body: string }}
  */
@@ -90,6 +95,8 @@ export function buildBarkRequest(cfg, payload) {
   const body = { title: payload.title, body: payload.body };
   const sound = pickBarkSound(cfg, payload.event);
   if (sound) body.sound = sound;
+  const group = nonEmptyString(cfg.group);
+  if (group) body.group = group;
   let url = `${server}/${deviceKey}`;
   if (payload.iconUrl) {
     // encodeURIComponent keeps & = + safe inside the query value.
