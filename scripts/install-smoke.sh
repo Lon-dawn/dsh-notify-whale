@@ -1,5 +1,5 @@
 #!/bin/bash
-# Install-path smoke for dsh-task-notify.
+# Install-path smoke for dsh-notify-whale.
 # Builds a fresh tarball, installs it into a throwaway consumer project,
 # and runs scripts/install-smoke.mjs against the installed module.
 # Exits 0 iff the full path (pack -> install -> import -> apply -> channel
@@ -15,7 +15,7 @@ trap 'rm -rf "$TMP"' EXIT
 
 cd "$ROOT"
 npm pack --cache "$LOCAL_CACHE" --pack-destination "$TMP" >/dev/null
-TGZ="$(ls -t "$TMP"/dsh-task-notify-*.tgz | head -1)"
+TGZ="$(ls -t "$TMP"/dsh-notify-whale-*.tgz | head -1)"
 
 mkdir -p "$TMP/app"
 cat > "$TMP/app/package.json" <<JSON
@@ -24,7 +24,7 @@ cat > "$TMP/app/package.json" <<JSON
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "dependencies": { "dsh-task-notify": "file:$TGZ" }
+  "dependencies": { "dsh-notify-whale": "file:$TGZ" }
 }
 JSON
 

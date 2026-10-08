@@ -1,10 +1,10 @@
-// Install-path smoke for dsh-task-notify (v0.3.0):
+// Install-path smoke for dsh-notify-whale (v0.5.0):
 //   - package entry loads and exports the public API
 //   - apply() with a mock ctx registers the agent/status listener
 //   - a synthetic event flows through to a recorded channel send
 //   - the v0.3 composed body joins summary + formatted local time
 import assert from 'node:assert/strict';
-import { apply, name, inject } from 'dsh-task-notify';
+import { apply, name, inject } from 'dsh-notify-whale';
 
 assert.equal(name, 'task-notify');
 assert.ok(Array.isArray(inject));

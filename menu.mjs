@@ -183,7 +183,7 @@ async function main() {
   let section = rawSection && typeof rawSection === 'object' ? { ...rawSection } : {};
 
   const rl = await makeIO();
-  console.log('dsh-task-notify 设置菜单（编辑 ' + DEFAULT_SETTINGS_PATH + '）');
+  console.log('dsh-notify-whale 设置菜单（编辑 ' + DEFAULT_SETTINGS_PATH + '）');
 
   let touched = false;
   try {

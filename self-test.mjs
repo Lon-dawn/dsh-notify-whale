@@ -37,7 +37,7 @@ function parseArgs(argv) {
 
 function printHelp() {
   console.log(`
-dsh-task-notify self-test
+dsh-notify-whale self-test
 
 用法：
   node self-test.mjs [--channel desktop|macos|windows|bark|ntfy|serverchan|webhook]
