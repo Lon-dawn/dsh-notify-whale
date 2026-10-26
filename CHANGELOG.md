@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.1
+
+- 修「发送测试通知」在手机上已收到、设置页却报「未收到发送结果——请确认插件已加载、配置可写。」（20s 超时）。根因是 HMR 事务嵌套：客户端点按钮 → 宿主 `SettingsForms.mutate` → `configEditor.edit` → `hmr.runExclusive` → `entry.update` → Loader `_commitVolatile` 在**事务内部同步**广播 `loader/volatile-update`；插件在该回调里写回 `testResult` 又要走 `hmr.runExclusive`，撞上 `HMR transactions cannot be nested`（`dsh-hmr/lib/index.js:749`）被拒，于是请求字段 `test.<channel>` 永久残留、`testResult` 永不出现。修法：用 `AsyncResource.bind` 在 `apply()`（事务外）创建调度器，把消费测试请求的动作排到事务之外执行（`Promise.then` / `setImmediate` / `setTimeout` 都会继承 AsyncLocalStorage 上下文，实测无效）。另加瞬时错误（嵌套 / 写锁超时）有限重试，避免并发写 patch 时偶发丢结果。
+- 新增 3 个回归测试：真实模拟 `AsyncLocalStorage` 事务守卫，验证「事务内触发 volatile-update 仍能写回」「瞬时错误会重试」「配置类错误不重试」。已用反向验证确认：移除修复后首个测试即失败。
+
+## 0.6.0
+
+- 设置页「发送测试通知」按钮：桌面 / Bark / ntfy / ServerChan / Webhook 每张卡片一个，点击后宿主只向该通道发一条样例通知，按钮旁显示真实结果（✓ 已发送 / ✗ HTTP 状态与错误详情）。测试强制启用目标通道，可在打开开关前先验证端点；测试读已保存配置，有未保存编辑时页面会提示先保存。实现：客户端把请求写入 volatile 字段 test.<channel>，宿主在 loader/volatile-update 里消费，结果经 settings 服务写回 testResult 随设置文档回流（DSH 不向第三方插件开放客户端→宿主 RPC；依赖的宿主机制已对照 0.2.1-rc.2 安装树实核）；nonce 去重 + 60s 过期防重发。
+- 通道层 send() 改为返回 {ok, detail} 结果对象（常规派发路径忽略之，行为不变）：self-test.mjs 与 npm run menu 的通道测试随之修复了「bark 404 也报成功」的误报。
+- 配置新增内部字段 test / testResult（volatile 标量，仅设置文档层使用），三层合并与未知键告警行为不变。
+
 ## 0.5.0 — 原生设置页
 
 **新增：侧边栏一级菜单「通知」**（DSH 0.1.7+），全部配置可在界面里改，**保存立即生效、无需重启**。

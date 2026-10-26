@@ -290,3 +290,48 @@ test('format 段不是对象时整体回退默认', () => {
   assert.deepEqual({ ...config.format }, { time: 'short', showDuration: true });
   assert.ok(warnings.some((w) => w.includes('format 段')));
 });
+
+/* ------------------------------------------------------------------ */
+/* 设置页「发送测试」请求/结果字段（test / testResult）                   */
+/* ------------------------------------------------------------------ */
+
+test('test 段：已知通道的字符串请求透传，未知键丢弃', () => {
+  const nonce = JSON.stringify({ ts: 1_750_000_000_000, n: 'abc-1' });
+  const { config, warnings } = resolveConfigDetailed(
+    { test: { bark: nonce, ntfy: '  raw  ', desktop: '', serverchan: 42, webhook: null, whatever: 'x' } },
+    {},
+    null,
+  );
+  assert.equal(config.test.bark, nonce);
+  assert.equal(config.test.ntfy, 'raw');
+  // 空值通道在归一化后省略（紧凑形式），消费端按「无请求」处理。
+  assert.equal(config.test.desktop, undefined);
+  assert.equal(config.test.serverchan, '42'); // 数字宽容转字符串（coerceTrimmedString 既有行为）
+  assert.equal(config.test.webhook, undefined);
+  assert.equal(config.test.whatever, undefined);
+  assert.ok(warnings.some((w) => w.includes('test 段未知键 "whatever"')));
+});
+
+test('test 段不是对象时整体回退默认并 warn', () => {
+  const { config, warnings } = resolveConfigDetailed({ test: 'nope' }, {}, null);
+  assert.deepEqual({ ...config.test }, {});
+  assert.ok(warnings.some((w) => w.includes('test 段不是对象')));
+});
+
+test('testResult 透传字符串，非字符串回退空串', () => {
+  const payload = JSON.stringify({ 'abc-1': { channel: 'bark', ok: true, detail: '', ts: 1 } });
+  const ok = resolveConfig({ testResult: payload }, {}, null);
+  assert.equal(ok.testResult, payload);
+  // 42 被宽容转成 '42'（coerceTrimmedString 既有行为）；真正的非标量才回退空串。
+  const coerced = resolveConfig({ testResult: 42 }, {}, null);
+  assert.equal(coerced.testResult, '42');
+  const bad = resolveConfigDetailed({ testResult: {} }, {}, null);
+  assert.equal(bad.config.testResult, '');
+  assert.ok(bad.warnings.some((w) => w.includes('testResult')));
+});
+
+test('默认配置携带 test/testResult（设置文档为空时按钮链路仍有形状）', () => {
+  const defaults = defaultConfig();
+  assert.deepEqual({ ...defaults.test }, {});
+  assert.equal(defaults.testResult, '');
+});

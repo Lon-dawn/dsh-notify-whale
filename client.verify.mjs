@@ -34,21 +34,43 @@ console.log('exports:', Object.keys(mod).join(', '), '| inject:', JSON.stringify
 const dictionaries = {};
 const slots = [];
 
-function makeCtx(snapshot) {
+/**
+ * 可控的假 configForm：快照可替换、订阅者可手动触发、mutate 有记录。
+ * 「发送测试」按钮的模型级行为（请求写入 / 结果落定 / 草稿保留）靠它驱动。
+ */
+function makeForm(initialSnapshot) {
+  let snapshot = initialSnapshot;
+  const subscribers = new Set();
+  const mutations = [];
   return {
+    form: {
+      getSnapshot: () => snapshot,
+      subscribe(listener) {
+        subscribers.add(listener);
+        return () => subscribers.delete(listener);
+      },
+      mutate: async (ops, revision) => {
+        mutations.push({ ops, revision });
+        return true;
+      },
+    },
+    setSnapshot(next) { snapshot = next; },
+    emit() { for (const listener of [...subscribers]) listener(); },
+    mutations,
+  };
+}
+
+function makeCtx(snapshot) {
+  const harness = makeForm(snapshot);
+  return {
+    __form: harness,
     effect(fn) { const dispose = fn(); return () => { if (typeof dispose === 'function') dispose(); }; },
     locale: {
       register(ns, dict) { dictionaries[ns] = dict.zh ?? dict.en; return () => {}; },
       bind(ns) { return (key) => (dictionaries[ns] ?? {})[key] ?? key; },
     },
     configForms: {
-      get() {
-        return {
-          getSnapshot: () => snapshot,
-          subscribe: () => () => {},
-          mutate: async () => true,
-        };
-      },
+      get: () => harness.form,
     },
     slots: {
       inject(_slot, callback) { const dispose = callback(); return () => { if (typeof dispose === 'function') dispose(); }; },
@@ -70,10 +92,12 @@ const READY_VALUE = {
   ntfy: { enabled: true, server: 'https://ntfy.example', topic: 'topic1', token: '' },
 };
 
+const READY_SNAPSHOT = { status: 'ready', writable: true, revision: 3, value: READY_VALUE };
+
 const CASES = [
   ['loading', { status: 'loading', writable: false, value: undefined, revision: undefined }],
   ['unavailable', { status: 'unavailable', writable: false, value: undefined, revision: undefined }],
-  ['ready', { status: 'ready', writable: true, revision: 3, value: READY_VALUE }],
+  ['ready', READY_SNAPSHOT],
 ];
 
 let failures = 0;
@@ -141,10 +165,111 @@ for (const [label, snapshot] of CASES) {
   if (label === 'ready') {
     check(hasForm, 'ready state renders the action footer');
     check(classes.has('tn-card'), 'ready state renders section cards');
+    // 「发送测试通知」按钮：desktop + 四个推送通道各一个。
+    const buttons = [];
+    (function collect(node) {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) return;
+      if (typeof node.type === 'string' && node.type === 'button' && typeof node.props?.className === 'string' && node.props.className.includes('tn-test')) {
+        buttons.push(node);
+      }
+      (Array.isArray(node.children) ? node.children : []).forEach(collect);
+    })(tree);
+    check(buttons.length === 5, `renders five test buttons, got ${buttons.length}`);
+    for (const channel of ['desktop', 'bark', 'ntfy', 'serverchan', 'webhook']) {
+      const button = buttons.find((b) => b.props.id === `tn-test-${channel}`);
+      check(button !== undefined && button.props.disabled === false, `test button for ${channel} is enabled`);
+    }
   } else {
     check(!hasForm, 'not-ready state renders no form');
     check(strings.length === 1, `not-ready state shows one notice: ${JSON.stringify(strings[0])}`);
+    check(!/tn-test/.test(JSON.stringify(tree.props ?? tree)), 'not-ready state renders no test buttons');
   }
+}
+
+/* ================================================================ */
+/* 「发送测试通知」模型级流程                                          */
+/* ================================================================ */
+console.log('\n=== model: test notification flow ===');
+
+{
+  slots.length = 0;
+  const ctx = makeCtx(READY_SNAPSHOT);
+  mod.apply(ctx);
+  const model = slots[0].options.inject().model;
+  const harness = ctx.__form;
+
+  // 1. 点击 → 写入 test.<channel> 请求字段（JSON {ts, n}），进入 pending 态。
+  model.requestTest('bark');
+  await Promise.resolve();
+  await Promise.resolve();
+  check(harness.mutations.length === 1, 'requestTest issues exactly one mutate');
+  const op = harness.mutations[0].ops[0];
+  check(op.op === 'set' && JSON.stringify(op.path) === JSON.stringify(['test', 'bark']), 'request op targets test.bark');
+  let request = {};
+  try { request = JSON.parse(op.value); } catch { /* checked below */ }
+  check(typeof request.ts === 'number' && typeof request.n === 'string' && request.n !== '', 'request carries ts + nonce');
+  // 不带固定 revision：由控制器在写队列执行时取最新（0.2.1 语义）。
+  check(harness.mutations[0].revision === undefined, 'request omits the fixed revision');
+  check(model.getSnapshot().testing === true, 'model reports a pending test');
+  const nonce = request.n;
+
+  // 2. pending 期间：按钮禁用、状态行显示发送中；再次点击被忽略。
+  let tree = slots[0].component({ t: ctx.locale.bind('task-notify'), ...slots[0].options.inject() });
+  const barkButton = (function find(node) {
+    if (!node || typeof node !== 'object' || Array.isArray(node)) return null;
+    if (node.props?.id === 'tn-test-bark') return node;
+    for (const child of Array.isArray(node.children) ? node.children : []) {
+      const hit = find(child);
+      if (hit) return hit;
+    }
+    return null;
+  })(tree);
+  check(barkButton !== null && barkButton.props.disabled === true, 'test button is disabled while pending');
+  model.requestTest('bark');
+  await Promise.resolve();
+  check(harness.mutations.length === 1, 'a second click while pending is ignored');
+
+  // 3. 未保存草稿在测试请求落地时必须保留（订阅回调不再无条件清草稿）。
+  model.edit('bark.server', 'https://changed.example');
+  check(model.getSnapshot().dirty === true, 'staged edit marks the form dirty');
+  harness.emit(); // 模拟请求写回落地的订阅推送
+  check(model.getSnapshot().dirty === true, 'landed test request keeps staged drafts');
+
+  // 4. 结果回流：宿主把 nonce → {ok, detail} 写进 testResult，随快照到达。
+  harness.setSnapshot({
+    ...READY_SNAPSHOT,
+    revision: READY_SNAPSHOT.revision + 2,
+    value: {
+      ...READY_SNAPSHOT.value,
+      testResult: JSON.stringify({ [nonce]: { channel: 'bark', ok: true, detail: 'HTTP 200', ts: Date.now() } }),
+    },
+  });
+  harness.emit();
+  const done = model.getSnapshot().tests('bark');
+  check(done !== null && done.phase === 'done' && done.ok === true && done.detail === 'HTTP 200', 'result settles the pending test as ok');
+  check(model.getSnapshot().testing === false, 'pending flag clears when the result arrives');
+  check(model.getSnapshot().dirty === true, 'landed result keeps staged drafts too');
+
+  // 5. 失败结果同样落定，detail 原样带给 UI。
+  model.requestTest('ntfy');
+  await Promise.resolve();
+  await Promise.resolve();
+  const failNonce = JSON.parse(harness.mutations[1].ops[0].value).n;
+  harness.setSnapshot({
+    ...READY_SNAPSHOT,
+    revision: READY_SNAPSHOT.revision + 3,
+    value: {
+      ...READY_SNAPSHOT.value,
+      testResult: JSON.stringify({ [failNonce]: { channel: 'ntfy', ok: false, detail: 'HTTP 401: bad token', ts: Date.now() } }),
+    },
+  });
+  harness.emit();
+  const failedTest = model.getSnapshot().tests('ntfy');
+  check(failedTest.phase === 'done' && failedTest.ok === false && failedTest.detail === 'HTTP 401: bad token', 'failed result carries the detail');
+
+  // 6. dispose 释放订阅（并清掉超时定时器，进程不得被定时器拖住）。
+  model.dispose();
+  check(true, 'dispose completes');
 }
 
 console.log(`\n${failures === 0 ? 'ALL CLIENT CHECKS PASSED' : failures + ' CHECK(S) FAILED'}`);

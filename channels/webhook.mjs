@@ -282,13 +282,18 @@ export function createChannel(config = {}, deps) {
    * Deliver one payload over HTTP. Any 2xx counts as success and stays
    * silent; non-2xx responses and transport errors are warned with the
    * status code plus the first 200 chars of the response, never rethrown.
+   * The send outcome is RETURNED as `{ok, detail}` so the settings-page
+   * test button (and self-test.mjs) can report the real result — the
+   * regular dispatch path ignores the return value.
    *
    * @param {{ event?: string, title?: string, body?: string,
    *   sessionId?: string, ts?: number, iconUrl?: string }} [payload]
-   * @returns {Promise<void>}
+   * @returns {Promise<{ok: boolean, detail: string}>}
    */
   async function send(payload = {}) {
-    if (config.enabled === false) return;
+    if (config.enabled === false) {
+      return { ok: false, detail: `${name} channel is disabled` };
+    }
 
     const normalized = {
       event: typeof payload.event === "string" ? payload.event : "",
@@ -312,15 +317,18 @@ export function createChannel(config = {}, deps) {
         body: request.body,
       });
       const status = Number(response?.status);
-      if (!(status >= 200 && status < 300)) {
-        const snippet = String(response?.text ?? "").slice(0, 200);
-        logger.warn(
-          `[task-notify] ${name} webhook responded ${status}: ${snippet || "(empty body)"}`,
-        );
+      if (status >= 200 && status < 300) {
+        return { ok: true, detail: `HTTP ${status}` };
       }
+      const snippet = String(response?.text ?? "").slice(0, 200);
+      logger.warn(
+        `[task-notify] ${name} webhook responded ${status}: ${snippet || "(empty body)"}`,
+      );
+      return { ok: false, detail: `HTTP ${status}${snippet ? `: ${snippet}` : ""}` };
     } catch (error) {
       const cause = error instanceof Error ? error.message : String(error);
       logger.warn(`[task-notify] ${name} webhook request failed: ${cause}`);
+      return { ok: false, detail: cause };
     }
   }
 

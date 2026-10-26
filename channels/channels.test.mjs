@@ -669,3 +669,75 @@ describe("channel registry", () => {
     assert.throws(() => createChannels({}, { run: async () => ({}) }), TypeError);
   });
 });
+
+/* ------------------------------------------------------------------ */
+/* send 结果对象（设置页「发送测试」与 self-test.mjs 的真实结果来源）      */
+/* ------------------------------------------------------------------ */
+
+describe("send outcome", () => {
+  test("webhook 2xx → { ok: true } 且 detail 带 HTTP 状态", async () => {
+    const deps = makeDeps();
+    const channel = createWebhookChannel({ kind: "bark", enabled: true, deviceKey: "k" }, deps);
+    const outcome = await channel.send(PAYLOAD);
+    assert.equal(outcome.ok, true);
+    assert.match(outcome.detail, /HTTP 200/);
+  });
+
+  test("webhook 非 2xx → { ok: false } 且 detail 携带状态码与响应片段，仍 warn", async () => {
+    const deps = makeDeps({
+      httpPost: async () => ({ status: 401, text: "bad device key" }),
+    });
+    const channel = createWebhookChannel({ kind: "bark", enabled: true, deviceKey: "k" }, deps);
+    const outcome = await channel.send(PAYLOAD);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.detail, /HTTP 401/);
+    assert.match(outcome.detail, /bad device key/);
+    assert.equal(deps.calls.warn.length, 1); // 常规派发路径的行为不变
+  });
+
+  test("webhook 传输错误 → { ok: false } 且 detail 是错误消息", async () => {
+    const deps = makeDeps({
+      httpPost: async () => { throw new Error("ECONNREFUSED"); },
+    });
+    const channel = createWebhookChannel({ kind: "ntfy", enabled: true, topic: "t" }, deps);
+    const outcome = await channel.send(PAYLOAD);
+    assert.equal(outcome.ok, false);
+    assert.equal(outcome.detail, "ECONNREFUSED");
+  });
+
+  test("webhook 禁用通道 → { ok: false } 且不发请求", async () => {
+    const deps = makeDeps();
+    const channel = createWebhookChannel({ kind: "bark", enabled: false, deviceKey: "k" }, deps);
+    const outcome = await channel.send(PAYLOAD);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.detail, /disabled/);
+    assert.equal(deps.calls.httpPost.length, 0);
+  });
+
+  test("windows toast 成功 → { ok: true }；run 失败 → { ok: false } 带 cause", async () => {
+    const okDeps = makeDeps();
+    const okChannel = createWindowsChannel({ enabled: true, sound: false }, okDeps);
+    const okOutcome = await okChannel.send(PAYLOAD);
+    assert.equal(okOutcome.ok, true);
+
+    const badDeps = makeDeps({
+      run: async () => { throw new Error("powershell not found"); },
+    });
+    const badChannel = createWindowsChannel({ enabled: true, sound: false }, badDeps);
+    const badOutcome = await badChannel.send(PAYLOAD);
+    assert.equal(badOutcome.ok, false);
+    assert.equal(badOutcome.detail, "powershell not found");
+    assert.equal(badDeps.calls.warn.length, 1);
+  });
+
+  test("macos 通知成功 → { ok: true }；osascript 失败 → { ok: false } 带 cause", async () => {
+    const badDeps = makeDeps({
+      run: async () => { throw new Error("osascript exited 1"); },
+    });
+    const badChannel = createMacosChannel({ enabled: true, sound: false }, badDeps);
+    const badOutcome = await badChannel.send(PAYLOAD);
+    assert.equal(badOutcome.ok, false);
+    assert.equal(badOutcome.detail, "osascript exited 1");
+    assert.equal(badDeps.calls.warn.length, 1);
+  });
+});

@@ -42,6 +42,15 @@ const EVENTS = ['idle', 'error', 'blocked', 'goal-completed', 'stopped', 'interr
 const SOUND_SLOTS = ['awaiting-approval', 'awaiting-answer', 'error', 'stopped', 'interrupted', 'truncated', 'blocked', 'idle'];
 
 /**
+ * Channels that carry a "send test notification" button (mirrors TEST_CHANNELS
+ * in index.mjs and TEST_REQUEST_FIELDS in config-schema.mjs). The request
+ * travels through the volatile config field `test.<channel>`; the Host writes
+ * the outcome into `testResult`, which arrives through this page's own form
+ * subscription — no client→Host RPC exists for third-party plugins.
+ */
+const TEST_CHANNELS = ['desktop', 'bark', 'ntfy', 'serverchan', 'webhook'];
+
+/**
  * Events whose notification TITLE can be overridden (config.titles).
  *
  * This set matches `TITLE_EVENTS` in config.mjs — the Host drops any other key,
@@ -116,6 +125,13 @@ const en = {
   saveFailed: 'The deployment did not accept these values; they were left for you to correct.',
   secretSet: 'A value is stored; type here to replace it.',
   invalidNumber: 'Enter a number, or leave blank to use the default.',
+  sendTest: 'Send test notification',
+  testPending: 'Sending…',
+  testOk: 'Test notification sent — check your device.',
+  testFailed: 'Send failed:',
+  testTimeout: 'No result came back — is the plugin loaded and the profile writable?',
+  testWriteFailed: 'The deployment rejected the request; try again.',
+  testHint: 'Tests use the saved settings — save your edits first.',
   event_idle: 'Task finished',
   event_error: 'Task failed',
   event_blocked: 'Needs your decision',
@@ -188,6 +204,13 @@ const zh = {
   saveFailed: '本部署没有接受这些值，已保留供你修改。',
   secretSet: '已存有值；输入即可替换。',
   invalidNumber: '请填数字；留空表示使用默认值。',
+  sendTest: '发送测试通知',
+  testPending: '发送中…',
+  testOk: '测试通知已发送，请查收。',
+  testFailed: '发送失败：',
+  testTimeout: '未收到发送结果——请确认插件已加载、配置可写。',
+  testWriteFailed: '部署拒绝了本次请求，请重试。',
+  testHint: '测试用的是已保存的配置——先保存再测试。',
   event_idle: '任务完成',
   event_error: '任务出错',
   event_blocked: '需要你决策',
@@ -289,6 +312,21 @@ window.__ModuleLoader__.load({
 .tn-discard:focus-visible, .tn-save:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
 
 .tn-note { font-size: 12px; line-height: 1.5; color: var(--dsw-alias-label-secondary); }
+
+/* Per-channel test row: a quiet secondary button plus an outcome line, below
+   the fields of its card (and outside the enabled-gated sub card, so a
+   channel can be tested before it is switched on). */
+.tn-testRow { display: flex; align-items: center; gap: 10px; padding: 2px 0 14px; }
+.tn-test { appearance: none; font: inherit; font-size: 13px; line-height: 1.5; cursor: pointer;
+  border: 1px solid var(--dsw-alias-border-l2); border-radius: 8px; padding: 5px 14px;
+  color: var(--dsw-alias-label-primary); background: transparent; flex: 0 0 auto; }
+.tn-test:hover:not(:disabled) { border-color: var(--dsw-alias-label-dimmed); }
+.tn-test:disabled { opacity: .4; cursor: default; }
+.tn-test:focus-visible { outline: 2px solid var(--dsw-alias-brand-primary); outline-offset: 1px; }
+.tn-testStatus { flex: 1; min-width: 0; margin: 0; font-size: 12px; line-height: 1.5;
+  color: var(--dsw-alias-label-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.tn-testStatus[data-kind="ok"] { color: var(--dsw-alias-state-success-primary, #067647); }
+.tn-testStatus[data-kind="fail"] { color: var(--dsw-alias-state-error-primary, #b42318); }
 `;
 
     /* ---------------------------------------------------------------- */
@@ -386,6 +424,69 @@ window.__ModuleLoader__.load({
       let savedAt = 0;
       let cache = null;
 
+      /* ---- 「发送测试通知」状态机 ----
+       *
+       * 请求：把 `test.<channel>` 写成 JSON {ts, n}（n 为 nonce），与本页的
+       * 草稿/保存完全独立——不走 edit/draft，直接 mutate（带 revision 栅栏）。
+       * 结果：宿主把 nonce → {ok, detail} 写进 testResult 字段，随设置文档
+       * 回流；subscribe 见到对应 nonce 即落定。一次只允许一个在途请求，
+       * 请求落地会触发订阅回调，所以「在途」必须挡住草稿清理。 */
+      const TEST_RESULT_TIMEOUT_MS = 20_000;
+      /** 通道 → { nonce, phase: 'pending'|'done'|'error', ok?, detail?, errorKind? } */
+      let tests = new Map();
+      /** 非空＝在途请求的 nonce（全局同时最多一个）。 */
+      let testing = '';
+      let testTimer = 0;
+
+      /** 解析宿主写回的 testResult 字符串（nonce → 结果对象）。 */
+      const parseTestResult = (value) => {
+        if (typeof value !== 'string' || value.trim() === '') return {};
+        try {
+          const parsed = JSON.parse(value);
+          return parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+        } catch {
+          return {};
+        }
+      };
+
+      const clearTestTimer = () => {
+        if (testTimer) {
+          clearTimeout(testTimer);
+          testTimer = 0;
+        }
+      };
+
+      /** 把某通道的 pending 态落定为错误（写入被拒 / 超时）。 */
+      const failTest = (channel, errorKind) => {
+        const current = tests.get(channel);
+        if (current && current.phase === 'pending') {
+          tests.set(channel, { ...current, phase: 'error', errorKind });
+        }
+        testing = '';
+        clearTestTimer();
+        emit();
+      };
+
+      /** 订阅回调里检查：在途 nonce 的结果是否已经随设置文档回流。 */
+      const settleTestFromSnapshot = () => {
+        if (testing === '') return;
+        const entry = parseTestResult(readPath(snapshot.value, 'testResult'))[testing];
+        if (!entry || typeof entry !== 'object') return;
+        for (const [channel, state] of tests) {
+          if (state.nonce === testing && state.phase === 'pending') {
+            tests.set(channel, {
+              ...state,
+              phase: 'done',
+              ok: entry.ok === true,
+              detail: typeof entry.detail === 'string' ? entry.detail : '',
+            });
+            break;
+          }
+        }
+        testing = '';
+        clearTestTimer();
+      };
+
       const build = () => {
         const view = snapshot;
         return {
@@ -396,6 +497,9 @@ window.__ModuleLoader__.load({
           saving,
           dirty: drafts.size > 0,
           savedAt,
+          /** 是否有测试请求在途（按钮的禁用条件之一）。 */
+          testing: testing !== '',
+          tests: (channel) => tests.get(channel) ?? null,
           draft: (path) => {
             const spec = specs[path] ?? { kind: 'text' };
             if (drafts.has(path)) return drafts.get(path);
@@ -417,7 +521,12 @@ window.__ModuleLoader__.load({
       const unsubscribe = form.subscribe(() => {
         snapshot = form.getSnapshot();
         // A landed write rebases the drafts; a stale one keeps them for retry.
-        if (!saving) drafts = new Map();
+        // 测试请求/结果落地同样触发本回调，但那不是用户的保存——必须保留草稿，
+        // 否则一次点击就会清掉用户未保存的编辑。先记「在途」再落定：落定会把
+        // testing 清空，顺序反了这次更新就会被当成普通写回而误清草稿。
+        const hadPendingTest = testing !== '';
+        settleTestFromSnapshot();
+        if (!saving && !hadPendingTest) drafts = new Map();
         emit();
       });
 
@@ -473,8 +582,38 @@ window.__ModuleLoader__.load({
           drafts = new Map();
           emit();
         },
+        /**
+         * 发送测试通知：写入 `test.<channel>` 请求字段，结果由宿主经
+         * testResult 回流（subscribe 里落定）。一次只允许一个在途请求；
+         * 保存进行中时也不允许（写队列共享）。故意不传 revision：控制器
+         * 在写队列执行时取最新 revision（0.2.1 行为），测试请求是最后落定
+         * 者为准的内部字段，固定旧 revision 只会在「上一个测试的结果写回
+         * 刚落地时立刻点下一个通道」的场景里白白撞上 SETTINGS CONFLICT。
+         */
+        requestTest: (channel) => {
+          if (saving || testing !== '' || !TEST_CHANNELS.includes(channel)) return;
+          const nonce = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+          testing = nonce;
+          tests.set(channel, { nonce, phase: 'pending', ok: false, detail: '', errorKind: '' });
+          emit();
+          const operation = { op: 'set', path: ['test', channel], value: JSON.stringify({ ts: Date.now(), n: nonce }) };
+          Promise.resolve(form.mutate([operation])).then(
+            (ok) => {
+              if (!ok) {
+                failTest(channel, 'write');
+                return;
+              }
+              // 请求已被接受；结果回流由 settleTestFromSnapshot 落定，
+              // 超时兜底防止只读部署/宿主缺席时按钮永远转圈。
+              clearTestTimer();
+              testTimer = setTimeout(() => failTest(channel, 'timeout'), TEST_RESULT_TIMEOUT_MS);
+            },
+            () => failTest(channel, 'write'),
+          );
+        },
         dispose: () => {
           listeners.clear();
+          clearTestTimer();
           unsubscribe();
         },
       };
@@ -666,6 +805,52 @@ window.__ModuleLoader__.load({
         });
       };
 
+      /**
+       * One channel's test row: a quiet button plus the outcome line. Rendered
+       * for every channel regardless of its enabled switch — the point is to
+       * let the user verify an endpoint BEFORE turning the channel on. The
+       * outcome of the LAST request for this channel stays visible until the
+       * next click.
+       */
+      const testRow = (channel) => {
+        const test = state.tests(channel);
+        const busy = disabled || state.saving || state.testing;
+        let status = null;
+        if (test) {
+          if (test.phase === 'pending') {
+            status = h('p', { className: 'tn-testStatus', 'data-kind': 'pending' }, t('testPending'));
+          } else if (test.phase === 'done' && test.ok) {
+            status = h('p', { className: 'tn-testStatus', 'data-kind': 'ok' }, t('testOk'));
+          } else if (test.phase === 'done') {
+            status = h('p', { className: 'tn-testStatus', 'data-kind': 'fail', title: test.detail },
+              `${t('testFailed')} ${test.detail}`.trim());
+          } else if (test.errorKind === 'timeout') {
+            status = h('p', { className: 'tn-testStatus', 'data-kind': 'fail' }, t('testTimeout'));
+          } else {
+            status = h('p', { className: 'tn-testStatus', 'data-kind': 'fail' }, t('testWriteFailed'));
+          }
+        } else if (state.dirty) {
+          // 测试读的是宿主当前持有的已保存配置，未保存的草稿不参与。
+          status = h('p', { className: 'tn-testStatus' }, t('testHint'));
+        }
+        return h(
+          'div',
+          { className: 'tn-testRow', key: `test-${channel}` },
+          h(
+            'button',
+            {
+              type: 'button',
+              className: 'tn-test',
+              id: `tn-test-${channel}`,
+              disabled: busy,
+              onClick: () => model.requestTest(channel),
+            },
+            t('sendTest'),
+          ),
+          status,
+        );
+      };
+
       const channelCard = (key, title, fields) =>
         h(
           'div',
@@ -708,6 +893,7 @@ window.__ModuleLoader__.load({
                   : null,
               )
             : null,
+          testRow(key),
         );
 
       return h(
@@ -740,6 +926,7 @@ window.__ModuleLoader__.load({
             { value: 'off', label: t('desktopOff') },
           ]),
           bool('desktop.sound', t('desktopSound'), null),
+          testRow('desktop'),
         ),
 
         h(

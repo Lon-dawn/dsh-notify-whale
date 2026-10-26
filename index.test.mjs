@@ -12,6 +12,7 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { apply, renderIconUrl } from './index.mjs';
 import { defaultConfig } from './config.mjs';
 
@@ -468,4 +469,312 @@ test('renderIconUrl：禁用 / 缺段 / 模板为空 / 畸形配置 → 一律�
   assert.equal(renderIconUrl({ enabled: true, urlTemplate: 42 }, 'idle'), ''); // 非字符串模板
   assert.equal(defaultConfig().icons.enabled, true); // 默认配置本身是开启的
   assert.equal(renderIconUrl(defaultConfig().icons, 'error'), ''); // 但默认无模板 → ""
+});
+
+/* ------------------------------------------------------------------ */
+/* 设置页「发送测试通知」按钮的宿主半边                                  */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 给假 ctx 补上 inject(['settings'], cb)：与 cordis 一样立即以「带服务的
+ * 子作用域」调用回调。child 用原型委托到 ctx，测试里只用得到 settings。
+ */
+function withInject(ctx, services) {
+  ctx.inject = (names, callback) => {
+    const child = Object.create(ctx);
+    for (const serviceName of names) child[serviceName] = services[serviceName];
+    callback(child);
+  };
+  return ctx;
+}
+
+/** 记录 settings.mutate 调用的假 settings 服务。 */
+function makeRecordingSettings() {
+  const mutations = [];
+  return { mutations, mutate: async (ns, ops) => { mutations.push({ ns, ops }); } };
+}
+
+/** 组装一个「测试请求已就绪」的场景：config.test.bark = 指定请求值。 */
+function makeTestScene(requestValue) {
+  const ctx = makeFakeCtx();
+  const settings = makeRecordingSettings();
+  withInject(ctx, { settings });
+  const createdWith = [];
+  const sent = [];
+  const nonce = typeof requestValue === 'string' ? '' : requestValue.n;
+  const overridesBag = {
+    config: fullConfig({
+      test: { bark: typeof requestValue === 'string' ? requestValue : JSON.stringify(requestValue) },
+    }),
+    createChannels: (cfg) => {
+      createdWith.push(cfg);
+      return [{
+        name: 'bark',
+        send: async (payload) => {
+          sent.push(payload);
+          return { ok: true, detail: 'HTTP 200' };
+        },
+      }];
+    },
+  };
+  apply(ctx, {}, overridesBag);
+  return { ctx, settings, createdWith, sent, nonce, overridesBag };
+}
+
+const flushTest = async () => {
+  await flushMicrotasks();
+  await flushMicrotasks();
+  await flushMicrotasks();
+};
+
+test('设置页测试请求：fresh nonce → 强制启用目标通道发样例通知并写回结果', async () => {
+  const nonce = `${Date.now().toString(36)}-unit01`;
+  const { ctx, settings, createdWith, sent } = makeTestScene({ ts: Date.now(), n: nonce });
+
+  ctx.emit('loader/volatile-update');
+  await flushTest();
+
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].event, 'idle');
+  assert.match(sent[0].body, /测试通知/);
+  assert.equal(sent[0].sessionId, 'test-bark');
+  // 一律强制启用：哪怕 bark.enabled=false 也要能试通端点；其他通道保持关闭。
+  assert.equal(createdWith[0].bark.enabled, true);
+  assert.equal(createdWith[0].ntfy.enabled, false);
+  assert.equal(createdWith[0].webhook.enabled, false);
+
+  assert.equal(settings.mutations.length, 1);
+  assert.equal(settings.mutations[0].ns, 'task-notify');
+  const unset = settings.mutations[0].ops.find((op) => op.op === 'unset');
+  assert.deepEqual(unset.path, ['test', 'bark']);
+  const set = settings.mutations[0].ops.find((op) => op.op === 'set');
+  assert.deepEqual(set.path, ['testResult']);
+  const result = JSON.parse(set.value);
+  assert.equal(result[nonce].ok, true);
+  assert.equal(result[nonce].channel, 'bark');
+});
+
+test('设置页测试请求：同一 nonce 二次到达不重复发送（nonce 去重）', async () => {
+  const { ctx, sent, settings } = makeTestScene({ ts: Date.now(), n: 'dup-1' });
+
+  ctx.emit('loader/volatile-update');
+  await flushTest();
+  assert.equal(sent.length, 1);
+
+  ctx.emit('loader/volatile-update');
+  await flushTest();
+  assert.equal(sent.length, 1); // 不重发
+  // 清理照做：第二次更新仍会尝试 unset 残留的请求字段（无 set 结果）。
+  const second = settings.mutations[1];
+  assert.ok(second.ops.every((op) => op.op === 'unset'));
+});
+
+test('设置页测试请求：陈旧请求只清理不发送', async () => {
+  const stale = makeTestScene({ ts: Date.now() - 120_000, n: 'old-1' });
+  stale.ctx.emit('loader/volatile-update');
+  await flushTest();
+  assert.equal(stale.sent.length, 0);
+  assert.equal(stale.settings.mutations.length, 1);
+  assert.ok(stale.settings.mutations[0].ops.every((op) => op.op === 'unset'));
+});
+
+test('设置页测试请求：非 JSON / 缺 nonce 的请求值按无效处理', async () => {
+  const garbage = makeTestScene('not-a-json');
+  garbage.ctx.emit('loader/volatile-update');
+  await flushTest();
+  assert.equal(garbage.sent.length, 0);
+
+  const missingNonce = makeTestScene({ ts: Date.now() });
+  missingNonce.ctx.emit('loader/volatile-update');
+  await flushTest();
+  assert.equal(missingNonce.sent.length, 0);
+});
+
+test('设置页测试请求：通道 send 报告失败 → testResult 记录 ok:false 与详情', async () => {
+  const ctx = makeFakeCtx();
+  const settings = makeRecordingSettings();
+  withInject(ctx, { settings });
+  const nonce = `${Date.now().toString(36)}-unit02`;
+  apply(ctx, {}, {
+    config: fullConfig({ test: { ntfy: JSON.stringify({ ts: Date.now(), n: nonce }) } }),
+    createChannels: () => [{
+      name: 'ntfy',
+      send: async () => ({ ok: false, detail: 'HTTP 401: unauthorized' }),
+    }],
+  });
+  ctx.emit('loader/volatile-update');
+  await flushTest();
+
+  const set = settings.mutations[0].ops.find((op) => op.op === 'set');
+  const result = JSON.parse(set.value);
+  assert.equal(result[nonce].ok, false);
+  assert.equal(result[nonce].detail, 'HTTP 401: unauthorized');
+});
+
+test('设置页测试请求：send 抛错（旧实现）→ 结果 ok:false 且不向外抛', async () => {
+  const ctx = makeFakeCtx();
+  const settings = makeRecordingSettings();
+  withInject(ctx, { settings });
+  const nonce = `${Date.now().toString(36)}-unit03`;
+  apply(ctx, {}, {
+    config: fullConfig({ test: { bark: JSON.stringify({ ts: Date.now(), n: nonce }) } }),
+    createChannels: () => [{
+      name: 'bark',
+      send: async () => { throw new Error('网络炸了'); },
+    }],
+  });
+  ctx.emit('loader/volatile-update');
+  await flushTest();
+
+  const set = settings.mutations[0].ops.find((op) => op.op === 'set');
+  const result = JSON.parse(set.value);
+  assert.equal(result[nonce].ok, false);
+  assert.match(result[nonce].detail, /网络炸了/);
+});
+
+test('设置页测试请求：settings 服务缺失 → 照常发送并 warn，不写回', async () => {
+  const ctx = makeFakeCtx(); // 无 inject
+  const nonce = `${Date.now().toString(36)}-unit04`;
+  const sent = [];
+  apply(ctx, {}, {
+    config: fullConfig({ test: { bark: JSON.stringify({ ts: Date.now(), n: nonce }) } }),
+    createChannels: () => [{ name: 'bark', send: async (payload) => { sent.push(payload); return { ok: true, detail: '' }; } }],
+  });
+  ctx.emit('loader/volatile-update');
+  await flushTest();
+
+  assert.equal(sent.length, 1);
+  assert.ok(ctx.logs.warn.some((msg) => msg.includes('settings 服务不可用')));
+});
+
+test('设置页测试请求：标题覆盖对测试通知同样生效', async () => {
+  const { ctx, sent } = makeTestScene({ ts: Date.now(), n: 'title-1' });
+  // overrides.config 是同一对象引用，直接改 titles 即可被 buildConfig 看到。
+  ctx.emit('loader/volatile-update');
+  await flushTest();
+  assert.equal(sent[0].title, '任务完成'); // format.mjs 内置文案
+});
+
+/* ------------------------------------------------------------------ */
+/* 回归：volatile-update 发生在 HMR 事务内部（v0.6.1 修的真实 bug）      */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 造一个「像 dsh-hmr 一样」的事务守卫：用 AsyncLocalStorage 标记当前是否
+ * 在 HMR 写事务里，事务内再调用 runExclusive 就直接拒绝。
+ *
+ * 这个测试存在的理由：宿主真实链路是
+ *   SettingsForms.mutate → configEditor.edit → hmr.runExclusive(run)
+ *     → entry.update → Loader._commitVolatile → 同步 emit('loader/volatile-update')
+ * 所以插件收到 volatile-update 时正处在事务内，它随后的写回如果直接调用
+ * settings.mutate，就会被 "HMR transactions cannot be nested" 拒绝——
+ * 现象正是「手机收到通知了，设置页却 20s 超时」。
+ * 之前所有测试都在事务外 emit，所以完全没覆盖到这条路径。
+ */
+function makeHmrGuard() {
+  const executing = new AsyncLocalStorage();
+  return {
+    /** 事务内调用 → 拒绝；事务外 → 执行。与 dsh-hmr/lib/index.js:748-756 同语义。 */
+    async runExclusive(operation) {
+      if (executing.getStore()) throw new Error('HMR transactions cannot be nested');
+      return executing.run(true, operation);
+    },
+    /** 在事务内跑一段操作，模拟 Lodar 提交 volatile 后同步 emit 的时机。 */
+    async insideTransaction(operation) {
+      return executing.run(true, operation);
+    },
+    isInside: () => executing.getStore() === true,
+  };
+}
+
+test('回归：volatile-update 在 HMR 事务内触发时，测试结果仍能写回（不得 nested 失败）', async () => {
+  const guard = makeHmrGuard();
+  const ctx = makeFakeCtx();
+  const mutations = [];
+  withInject(ctx, {
+    settings: {
+      // 真实宿主的 mutate 最终走 configEditor.edit → hmr.runExclusive，
+      // 所以这里也必须过同一道事务守卫，才能复现嵌套拒绝。
+      mutate: async (ns, ops) => {
+        await guard.runExclusive(async () => { mutations.push({ ns, ops }); });
+      },
+    },
+  });
+  const nonce = `${Date.now().toString(36)}-tx01`;
+  const sent = [];
+  apply(ctx, {}, {
+    config: fullConfig({ test: { bark: JSON.stringify({ ts: Date.now(), n: nonce }) } }),
+    createChannels: () => [{ name: 'bark', send: async (payload) => { sent.push(payload); return { ok: true, detail: 'HTTP 200' }; } }],
+  });
+
+  // 关键：在事务内部 emit，正是宿主 Loader._commitVolatile 的位置。
+  await guard.insideTransaction(() => {
+    ctx.emit('loader/volatile-update');
+  });
+  assert.equal(guard.isInside(), false, '事务应当已结束');
+  await flushTest();
+  await flushTest();
+
+  assert.equal(sent.length, 1, '通知应当照常发出');
+  assert.equal(mutations.length, 1, '写回必须落地，而不是被 nested 拒绝');
+  const set = mutations[0].ops.find((op) => op.op === 'set');
+  assert.deepEqual(set.path, ['testResult']);
+  assert.equal(JSON.parse(set.value)[nonce].ok, true);
+  assert.ok(
+    !ctx.logs.warn.some((msg) => msg.includes('写回失败')),
+    `不应出现写回失败日志，实际：${JSON.stringify(ctx.logs.warn)}`,
+  );
+});
+
+test('回归：写回遇到瞬时嵌套错误仍会重试，并最终成功', async () => {
+  const ctx = makeFakeCtx();
+  const mutations = [];
+  let attempts = 0;
+  withInject(ctx, {
+    settings: {
+      mutate: async (ns, ops) => {
+        attempts += 1;
+        // 前两次模拟「调用时仍被判定在事务内」，第三次成功。
+        if (attempts <= 2) throw new Error('HMR transactions cannot be nested');
+        mutations.push({ ns, ops });
+      },
+    },
+  });
+  const nonce = `${Date.now().toString(36)}-tx02`;
+  apply(ctx, {}, {
+    config: fullConfig({ test: { bark: JSON.stringify({ ts: Date.now(), n: nonce }) } }),
+    createChannels: () => [{ name: 'bark', send: async () => ({ ok: true, detail: '' }) }],
+  });
+
+  ctx.emit('loader/volatile-update');
+  // 重试节奏是 150ms + 600ms，给足时间。
+  await new Promise((resolve) => { setTimeout(resolve, 1200); });
+
+  assert.equal(attempts, 3, '应当重试两次后成功');
+  assert.equal(mutations.length, 1, '最终写回必须落地');
+});
+
+test('回归：非瞬时错误不重试，只 warn 一次', async () => {
+  const ctx = makeFakeCtx();
+  let attempts = 0;
+  withInject(ctx, {
+    settings: {
+      mutate: async () => {
+        attempts += 1;
+        const error = new Error('No configurable plugin entry "task-notify"');
+        throw error;
+      },
+    },
+  });
+  const nonce = `${Date.now().toString(36)}-tx03`;
+  apply(ctx, {}, {
+    config: fullConfig({ test: { bark: JSON.stringify({ ts: Date.now(), n: nonce }) } }),
+    createChannels: () => [{ name: 'bark', send: async () => ({ ok: true, detail: '' }) }],
+  });
+
+  ctx.emit('loader/volatile-update');
+  await new Promise((resolve) => { setTimeout(resolve, 1200); });
+
+  assert.equal(attempts, 1, '配置类错误重试也没用，应只尝试一次');
+  assert.ok(ctx.logs.warn.some((msg) => msg.includes('测试结果写回失败')));
 });

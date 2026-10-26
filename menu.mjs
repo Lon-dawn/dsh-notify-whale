@@ -122,8 +122,19 @@ async function sendTest(channelKey) {
     iconUrl: '',
   };
   for (const c of targets) {
-    try { await c.send(payload); console.log('  [ok] 通道 "' + c.name + '" 发送成功'); }
-    catch (e) { console.log('  [x] 通道 "' + c.name + '" 发送失败:', e.message); }
+    try {
+      // send() 返回 {ok, detail}（本 fork 起）：按真实结果打印，非 2xx /
+      // 传输错误不再被误报为成功。旧实现只认 reject，会把 bark 404 这类
+      // 配置错误显示成「发送成功」。
+      const outcome = await Promise.resolve(c.send(payload)).then(
+        (r) => (r !== null && typeof r === 'object' && typeof r.ok === 'boolean' ? r : { ok: true, detail: '' }),
+        (e) => ({ ok: false, detail: e?.message ?? String(e) }),
+      );
+      if (outcome.ok) console.log('  [ok] 通道 "' + c.name + '" 发送成功' + (outcome.detail ? '（' + outcome.detail + '）' : ''));
+      else console.log('  [x] 通道 "' + c.name + '" 发送失败:', outcome.detail || '未知原因');
+    } catch (e) {
+      console.log('  [x] 通道 "' + c.name + '" 发送失败:', e.message);
+    }
   }
 }
 

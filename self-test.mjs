@@ -143,13 +143,21 @@ async function main() {
       continue;
     }
     try {
-      await Promise.resolve(channel.send(samplePayload)).then(
-        () => console.log(`✓ ${name}`),
-        (error) => {
-          console.error(`✗ ${name}：%s`, error?.message ?? error);
-          failed++;
-        },
+      // send() 返回 {ok, detail}（本 fork 起）：通道层不再把非 2xx/传输错误
+      // 吞成「成功」，这里按真实结果打印 ✓/✗。旧实现（只 reject 才算失败）
+      // 会把 bark 404 这类配置错误误报为通过。
+      const outcome = await Promise.resolve(channel.send(samplePayload)).then(
+        (result) => (result !== null && typeof result === 'object' && typeof result.ok === 'boolean'
+          ? result
+          : { ok: true, detail: '' }),
+        (error) => ({ ok: false, detail: error?.message ?? String(error) }),
       );
+      if (outcome.ok) {
+        console.log(`✓ ${name}${outcome.detail ? `（${outcome.detail}）` : ''}`);
+      } else {
+        console.error(`✗ ${name}：%s`, outcome.detail || '未知原因');
+        failed++;
+      }
     } catch (error) {
       console.error(`✗ ${name}：%s`, error?.message ?? error);
       failed++;

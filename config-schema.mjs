@@ -86,6 +86,27 @@ const TITLE_BY_EVENT_FIELDS = Schema.object({
   'awaiting-answer': Schema.string().default('').volatile(),
 }).default({});
 
+/**
+ * 设置页「发送测试通知」按钮的请求/结果字段（本 fork 新增）。
+ *
+ * DSH 0.1.7 没有面向第三方插件的客户端→宿主 RPC（remote 服务是 typert 预声明
+ * 的，事件转发也是固定白名单），所以测试请求走「volatile 配置字段」这条已验证
+ * 的管道：客户端把请求写进 `test.<channel>`（JSON 字符串 `{ts, n}`），宿主在
+ * `loader/volatile-update` 里看到非空请求 → 只向该通道发一条样例通知 → 把结果
+ * 写进 `testResult`（JSON：nonce → {channel, ok, detail, ts}）并清空请求字段；
+ * 结果经设置文档自动回流到客户端表单。
+ *
+ * 与通道段同规格：段对象不 volatile、叶子标量 volatile，才能穿过 settings
+ * 表单的写路径（isVolatilePath 校验）。
+ */
+const TEST_REQUEST_FIELDS = Schema.object({
+  desktop: Schema.string().default('').volatile(),
+  bark: Schema.string().default('').volatile(),
+  ntfy: Schema.string().default('').volatile(),
+  serverchan: Schema.string().default('').volatile(),
+  webhook: Schema.string().default('').volatile(),
+}).default({});
+
 const ntfySchema = Schema.object({
   enabled: Schema.boolean().default(false).volatile(),
   server: serverField('https://ntfy.sh'),
@@ -146,4 +167,6 @@ export const Config = Schema.object({
   ntfy: ntfySchema,
   serverchan: serverchanSchema,
   webhook: webhookSchema,
+  test: TEST_REQUEST_FIELDS,
+  testResult: Schema.string().default('').volatile(),
 });

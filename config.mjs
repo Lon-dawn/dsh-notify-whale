@@ -73,6 +73,9 @@ export function defaultConfig() {
     format: { time: 'short', showDuration: true },
     // 通知标题覆盖层：事件名 → 自定义标题；空映射＝全部用 format.mjs 的内置文案。
     titles: {},
+    // 设置页「发送测试」按钮的请求/结果字段（仅设置文档层写入，见 config-schema.mjs）。
+    test: {},
+    testResult: '',
   };
 }
 
@@ -83,10 +86,14 @@ export const TITLE_EVENTS = Object.freeze([
   'awaiting-approval', 'awaiting-answer',
 ]);
 
+/** 设置页「发送测试」按钮可指定的通道（与 config-schema 的 TEST_REQUEST_FIELDS 对应）。 */
+export const TEST_CHANNELS = Object.freeze(['desktop', 'bark', 'ntfy', 'serverchan', 'webhook']);
+
 /** 各层级允许出现的键（未知键忽略 + warn）。通道段内部键单独校验。 */
 const KNOWN_TOP_KEYS = new Set([
   'enabled', 'notifyOn', 'agents', 'coalesceWindowMs', 'maxBodyLength',
   'desktop', 'bark', 'ntfy', 'serverchan', 'webhook', 'icons', 'format', 'titles',
+  'test', 'testResult',
 ]);
 const KNOWN_SECTION_KEYS = {
   desktop: new Set(['enabled', 'sound']),
@@ -97,6 +104,7 @@ const KNOWN_SECTION_KEYS = {
   icons: new Set(['enabled', 'urlTemplate']),
   format: new Set(['time', 'showDuration']),
   titles: new Set(TITLE_EVENTS),
+  test: new Set(TEST_CHANNELS),
 };
 
 /**
@@ -336,6 +344,31 @@ function normalizeInPlace(cfg, warn) {
   // 通知标题覆盖层：事件名 → 自定义标题。空值表示「用内置标题」，因此这里
   // 只保留非空字符串；未知事件名丢弃，避免拼错的事件名静默生效。
   cfg.titles = normalizeTitles(cfg.titles, warn);
+
+  // 设置页「发送测试」的请求/结果字段：透传字符串，其余一律清空。
+  // 请求值是 JSON 文本（{ts, n}），只有 index.mjs 的消费方负责解析，
+  // 配置层只保证「已知键 → 修剪后的字符串」，坏值在消费端按无效丢弃。
+  if (!isPlainObject(cfg.test)) {
+    warn('test 段不是对象，已回退默认值');
+    cfg.test = {};
+  }
+  cfg.test = normalizeTestRequests(cfg.test);
+  cfg.testResult = withFallback(coerceTrimmedString(cfg.testResult), '', 'testResult', warn);
+}
+
+/**
+ * 归一化 test 请求段：只保留已知通道的非空字符串值。
+ *
+ * @param {object} test 原始 test 段
+ * @returns {Record<string, string>} 通道名 → 请求 JSON 文本（可能为空映射）
+ */
+function normalizeTestRequests(test) {
+  const out = {};
+  for (const channel of TEST_CHANNELS) {
+    const value = coerceTrimmedString(test[channel]);
+    if (value.ok && value.value !== '') out[channel] = value.value;
+  }
+  return out;
 }
 
 /**

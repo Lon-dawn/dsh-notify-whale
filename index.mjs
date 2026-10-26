@@ -53,11 +53,24 @@
  */
 
 import { execFile } from 'node:child_process';
+import { AsyncResource } from 'node:async_hooks';
 import { resolveConfig, isPlainObject } from './config.mjs';
 import { createCoalescer } from './dedupe.mjs';
 import { Config } from './config-schema.mjs';
 
 export const name = 'task-notify';
+
+/**
+ * 设置页「发送测试」按钮可指定的通道（与 config-schema 的 TEST_REQUEST_FIELDS、
+ * config.mjs 的 TEST_CHANNELS 对应；desktop 的通道实现按平台自动选择）。
+ */
+const TEST_CHANNELS = Object.freeze(['desktop', 'bark', 'ntfy', 'serverchan', 'webhook']);
+/** 测试请求超过这个年龄视为陈旧（客户端早已放弃等待），只清理不发送。 */
+const TEST_REQUEST_MAX_AGE_MS = 60_000;
+/** testResult 里保留的最近结果条数上限，防止设置文档无限增长。 */
+const TEST_RESULT_KEEP = 8;
+/** 客户端等待测试结果的兜底时长；超过后宿主允许丢弃过期的请求记录。 */
+const TEST_RESULT_TTL_MS = 10 * 60_000;
 
 /**
  * 0.1.7 settings schema. `@deepseek-ai/dsh-settings` treats an entry as
@@ -206,6 +219,53 @@ export function apply(ctx, input = {}, overrides = {}) {
   };
 
   /**
+   * 把回调「逃逸」出触发它的那个 AsyncLocalStorage 上下文再执行。
+   *
+   * ── 为什么必须这样做（v0.6.1 修复，实测复现）───────────────────────────
+   * 客户端点「发送测试通知」时，宿主链路是：
+   *   SettingsForms.mutate → configEditor.edit → **hmr.runExclusive(run)**
+   *     → reconcileProfilePatches → entry.update → Loader._commitVolatile
+   *       → **同步 emit('loader/volatile-update')** ← 我们在这里被调用
+   * 也就是说，本插件收到 volatile-update 的那一刻，**正处在 HMR 写事务内部**。
+   * 而写回测试结果走的 settings.mutate 最终同样要 `hmr.runExclusive`，于是：
+   *   `HMR transactions cannot be nested`（dsh-hmr/lib/index.js:749）
+   * 结果就是「手机收到了，设置页却 20s 超时」——请求字段 `test.<channel>`
+   * 永远留在 patch 里，`testResult` 永远不出现。
+   *
+   * ── 为什么 Promise.then / setTimeout / setImmediate 都不管用 ──────────
+   * AsyncLocalStorage 的上下文会随 Promise 链与定时器**一起传递**（实测
+   * Promise.then、setImmediate、setTimeout、setInterval 四种全都在事务内）。
+   * 唯一可靠的手段是用 `AsyncResource.bind` 在**事务外**创建绑定：本函数在
+   * `apply()` 里执行，那时还没有任何 HMR 事务，bind 出来的调度器因此携带
+   * 空上下文，每次调用都从干净栈出发。
+   *
+   * 顺带一提，这也解释了为什么「配置热更新生效了、但结果写不回去」——
+   * 二者共用同一个 volatile-update 入口，前者不需要写回所以正常。
+   *
+   * @param {Function} fn 要在事务外执行的函数
+   */
+  const scheduleOutsideHmrTransaction = AsyncResource.bind(
+    (fn) => {
+      setImmediate(() => {
+        try {
+          const result = fn();
+          if (result && typeof result.then === 'function') {
+            result.then(null, () => {});
+          }
+        } catch {}
+      });
+    },
+    'task-notify/escape-hmr-transaction',
+  );
+
+  /**
+   * 在事务外处理测试请求（fire-and-forget，绝不影响 volatile-update 的返回）。
+   */
+  function scheduleTestProcessing() {
+    scheduleOutsideHmrTransaction(() => processTestRequests());
+  }
+
+  /**
    * 0.1.7 热更新：设置页改的是 Config 里的 volatile 字段，Loader 会**原地提交**到
    * 那些引用上，然后广播 `loader/volatile-update`——行本身不会被重新 mount。
    * 所以这里必须自己重解析配置并丢弃已建好的通道，否则手机端的服务器/铃声
@@ -219,10 +279,274 @@ export function apply(ctx, input = {}, overrides = {}) {
         // 通道是按旧配置构造的（url/headers/凭据都在闭包里），必须重建。
         channelsReady = null;
         logger.info('[task-notify] 配置已热更新，通道已重建');
+        // 设置页「发送测试」按钮的请求也走 volatile 字段（见 processTestRequests）。
+        // fire-and-forget：绝不 await，失败只 warn。
+        // ⚠️ 必须经 escapeHmrTransaction，见该函数的注释。
+        scheduleTestProcessing();
       } catch (error) {
         logger.warn(`[task-notify] 热更新配置失败，沿用旧配置：${describe(error)}`);
       }
     });
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* 设置页「发送测试通知」按钮（本 fork 新增）                            */
+  /* ------------------------------------------------------------------ */
+
+  /**
+   * DSH 没有面向第三方插件的客户端→宿主 RPC（remote 服务是 typert 预声明
+   * 的，事件转发是固定白名单），所以测试请求走「volatile 配置字段」这条已验证
+   * 的管道：客户端经 configForms 把 `test.<channel>` 写成 JSON `{ts, n}`（n 为
+   * nonce），这里的 volatile-update 监听消费它；发送结果经 `settings` 服务写回
+   * `testResult`（nonce → {channel, ok, detail, ts}），随设置文档自动回流到
+   * 客户端表单。字段定义见 config-schema.mjs，客户端半边见 client.js。
+   *
+   * 依赖的宿主机制已对照 0.2.1-rc.2 安装树（桌面版 app.asar）逐项实核：
+   * SettingsForms.mutate(ns, ops, expectedRevision?)、isVolatilePath 写路径
+   * 准入、"settings" 服务名与 per-context 注入（ctx.inject）、
+   * loader/volatile-update 派发、settings/document-updated 回流——与
+   * 0.1.7 语义一致。
+   */
+
+  /** settings 服务（每插件实例一份）：写回测试结果用。缺失时降级为「只发不回报」。 */
+  let settingsService = null;
+  if (typeof ctx.inject === 'function') {
+    try {
+      // 与官方插件同款用法（如 dsh-client-locale）：子作用域里 settings 即本插件
+      // 自己的 SettingsForms，可写本 entry 的 volatile 字段。
+      ctx.inject(['settings'], (child) => {
+        settingsService = child?.settings ?? null;
+      });
+    } catch (error) {
+      logger.warn(`[task-notify] settings 服务注入失败，测试通知将无法回报结果：${describe(error)}`);
+    }
+  }
+
+  /** 已处理过的 nonce → 时间；防止重复派发（我们自己写回结果也会触发 volatile-update）。 */
+  const handledTestNonces = new Map();
+
+  function pruneHandledNonces(now) {
+    for (const [nonce, at] of handledTestNonces) {
+      if (now - at > TEST_RESULT_TTL_MS) handledTestNonces.delete(nonce);
+    }
+  }
+
+  /**
+   * 从配置里取出所有待处理的测试请求。
+   * @returns {{ channel: string, nonce: string, fresh: boolean }[]}
+   */
+  function collectTestRequests() {
+    const test = isPlainObject(config.test) ? config.test : {};
+    const now = deps.now();
+    pruneHandledNonces(now);
+    /** @type {{ channel: string, nonce: string, fresh: boolean }[]} */
+    const requests = [];
+    for (const channel of TEST_CHANNELS) {
+      const raw = typeof test[channel] === 'string' ? test[channel].trim() : '';
+      if (raw === '') continue;
+      let nonce = '';
+      let ts = 0;
+      try {
+        const parsed = JSON.parse(raw);
+        if (isPlainObject(parsed)) {
+          nonce = typeof parsed.n === 'string' ? parsed.n : '';
+          ts = typeof parsed.ts === 'number' && Number.isFinite(parsed.ts) ? parsed.ts : 0;
+        }
+      } catch {
+        /* 不是 JSON：手写的/损坏的值，按无效处理（只清理不发送） */
+      }
+      const age = ts > 0 ? now - ts : Infinity;
+      const valid = nonce !== '' && age >= 0 && age <= TEST_REQUEST_MAX_AGE_MS;
+      const fresh = valid && !handledTestNonces.has(nonce);
+      if (fresh) handledTestNonces.set(nonce, now);
+      requests.push({ channel, nonce, fresh });
+    }
+    return requests;
+  }
+
+  /**
+   * 为单个通道临时构造「只启用该通道」的通道数组。
+   *
+   * 测试一律强制启用（enabled: true / desktop 'on'）：按钮表达的是
+   * 「现在验证这个通道」，用户应该能在启用开关之前先试通端点。
+   * 不走共享的 getChannels() 缓存——那是按真实配置的 enabled 建的。
+   */
+  function createChannelsForTest(channel) {
+    const testConfig = {
+      ...config,
+      desktop: { ...config.desktop, enabled: 'on' },
+      bark: { ...config.bark, enabled: channel === 'bark' },
+      ntfy: { ...config.ntfy, enabled: channel === 'ntfy' },
+      serverchan: { ...config.serverchan, enabled: channel === 'serverchan' },
+      webhook: { ...config.webhook, enabled: channel === 'webhook' },
+    };
+    if (typeof overrides.createChannels === 'function') {
+      return Promise.resolve(overrides.createChannels(testConfig, deps));
+    }
+    return import('./channels/index.mjs').then((module) => module.createChannels(testConfig, deps));
+  }
+
+  /**
+   * 向单个通道发送一条样例通知并等待真实结果。
+   * @param {string} channel 通道名（TEST_CHANNELS 之一）
+   * @returns {Promise<{ok: boolean, detail: string}>}
+   */
+  async function sendTestNotification(channel) {
+    const ts = deps.now();
+    const rawBody = `测试通知（${channel}）@ ${new Date(ts).toLocaleString()} —— 收到即表示该通道配置正确`;
+    const payload = {
+      event: 'idle',
+      title: applyTitleOverride(config.titles, 'idle', format.formatTitle('idle')),
+      body: typeof format.composeBody === 'function'
+        ? format.composeBody(rawBody, {
+            ts,
+            timeStyle: config.format.time,
+            showDuration: false, // 测试没有「用时」语义
+            maxLen: config.maxBodyLength,
+          })
+        : format.formatBody(rawBody, config.maxBodyLength),
+      sessionId: `test-${channel}`,
+      agentId: `test-${channel}`,
+      ts,
+      iconUrl: renderIconUrl(config.icons, 'idle'),
+    };
+    try {
+      const channels = await createChannelsForTest(channel);
+      const target = Array.isArray(channels) ? channels.find((c) => c && c.name === channel) : null;
+      if (!target || typeof target.send !== 'function') {
+        return {
+          ok: false,
+          detail: channel === 'desktop'
+            ? '本平台没有可用的桌面通知通道'
+            : '通道初始化失败（缺少凭据或配置不完整）',
+        };
+      }
+      const outcome = await Promise.resolve().then(() => target.send(payload));
+      // 兼容不返回结果对象的旧通道实现：正常落定即视为成功。
+      if (outcome && typeof outcome === 'object' && typeof outcome.ok === 'boolean') return outcome;
+      return { ok: true, detail: '' };
+    } catch (error) {
+      return { ok: false, detail: describe(error) };
+    }
+  }
+
+  /**
+   * 把测试结果合并进 testResult（JSON 字符串），只保留最近 TEST_RESULT_KEEP 条
+   * 且未过 TTL 的记录，防止设置文档随测试次数无限增长。结果以客户端生成的
+   * nonce 为键——客户端正是拿自己发出的 nonce 来匹配结果、结束等待态的。
+   * @param {string} previous 配置里当前的 testResult 字符串
+   * @param {{channel: string, nonce: string}} request 被处理的请求
+   * @param {{ok: boolean, detail: string}} outcome 发送结果
+   * @param {number} ts 结果时间
+   * @returns {string}
+   */
+  function mergeTestResult(previous, request, outcome, ts) {
+    let entries = {};
+    try {
+      const parsed = JSON.parse(typeof previous === 'string' && previous.trim() !== '' ? previous : '{}');
+      if (isPlainObject(parsed)) entries = parsed;
+    } catch {
+      entries = {};
+    }
+    entries[request.nonce] = { channel: request.channel, ok: outcome.ok === true, detail: String(outcome.detail ?? ''), ts };
+    // 以 ts 倒序保留最新的若干条。
+    const kept = Object.entries(entries)
+      .sort(([, a], [, b]) => (Number(b?.ts) || 0) - (Number(a?.ts) || 0))
+      .filter(([, entry]) => Number(entry?.ts) > 0 && deps.now() - Number(entry.ts) <= TEST_RESULT_TTL_MS)
+      .slice(0, TEST_RESULT_KEEP);
+    return JSON.stringify(Object.fromEntries(kept));
+  }
+
+  /**
+   * 判定一个写回失败是不是「等一会儿就好了」的瞬时错误。
+   *
+   * 两类情形都源于宿主的串行化机制，重试即可恢复：
+   *  - `HMR transactions cannot be nested`（dsh-hmr:749）——本次调用仍落在
+   *    某个 HMR 事务里。正常情况下 scheduleOutsideHmrTransaction 已把它排开，
+   *    这里只作为兜底，防止宿主将来把 volatile-update 挪进别的异步边界。
+   *  - `atomic-write: timed out waiting for the writer lock`（atomic-write:208）
+   *    —— 写 patch 文件的 `package.json.lock` 被别人占着；默认只等 2s。
+   * @param {unknown} error 捕获到的错误
+   * @returns {boolean} true 表示值得重试
+   */
+  function isTransientWriteError(error) {
+    if (!error || typeof error !== 'object') return false;
+    const message = String(error.message ?? '');
+    const code = String(error.code ?? '');
+    return message.includes('HMR transactions cannot be nested')
+      || message.includes('timed out waiting for the writer lock')
+      || code === 'ELOCKED'
+      || code === 'EBUSY';
+  }
+
+  /** 瞬时写回错误的重试节奏：首次失败后 150ms、600ms 各再试一次。 */
+  const WRITE_RETRY_DELAYS_MS = Object.freeze([150, 600]);
+
+  /**
+   * 写回测试结果，瞬时错误自动重试。
+   * @param {{op: string, path: string[], value?: unknown}[]} ops 配置写操作
+   */
+  async function mutateWithRetry(ops) {
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        await settingsService.mutate(name, ops);
+        return;
+      } catch (error) {
+        if (attempt >= WRITE_RETRY_DELAYS_MS.length || !isTransientWriteError(error)) throw error;
+        await new Promise((resolve) => { setTimeout(resolve, WRITE_RETRY_DELAYS_MS[attempt]); });
+      }
+    }
+  }
+
+  /**
+   * 消费本次 volatile-update 带来的测试请求：并发发送、批量清理请求字段、
+   * 一次性写回结果。整个过程绝不向宿主抛错。
+   */
+  async function processTestRequests() {
+    const requests = collectTestRequests();
+    if (requests.length === 0) return;
+
+    // 并发发送全部 fresh 请求；stale/invalid 的只随本次批量清理掉。
+    const outcomes = await Promise.all(
+      requests.map(async (request) => ({
+        request,
+        outcome: request.fresh ? await sendTestNotification(request.channel) : null,
+      })),
+    );
+
+    if (!settingsService || typeof settingsService.mutate !== 'function') {
+      const sent = outcomes.filter((item) => item.outcome !== null);
+      if (sent.length > 0) {
+        logger.warn('[task-notify] settings 服务不可用，测试通知已发送但结果无法写回设置页');
+      }
+      return;
+    }
+
+    const ops = [];
+    let testResult = config.testResult;
+    for (const { request, outcome } of outcomes) {
+      ops.push({ op: 'unset', path: ['test', request.channel] });
+      if (outcome !== null) {
+        testResult = mergeTestResult(testResult, request, outcome, deps.now());
+      }
+    }
+    if (testResult !== config.testResult) {
+      ops.push({ op: 'set', path: ['testResult'], value: testResult });
+    }
+    try {
+      // 不带 revision 做乐观锁：宿主侧写回最后落定者为准，客户端的请求写入
+      // 有自己的 revision 栅栏，两边不会互相覆盖出脏数据。
+      //
+      // 本函数由 scheduleTestProcessing() 在 HMR 事务之外调用（见
+      // scheduleOutsideHmrTransaction 的注释）；若在事务内调用，宿主的
+      // hmr.runExclusive 会以 "HMR transactions cannot be nested" 拒绝，
+      // 表现为「手机收到了、设置页 20s 超时」。
+      await mutateWithRetry(ops);
+    } catch (error) {
+      // 写回失败：请求字段留在文档里，下次 volatile-update 会再尝试清理；
+      // nonce 去重保证不会重复发送。
+      logger.warn(`[task-notify] 测试结果写回失败：${describe(error)}`);
+    }
   }
 
   const coalescer = createCoalescer(

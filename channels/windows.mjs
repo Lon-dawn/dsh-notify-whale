@@ -163,13 +163,17 @@ export function createChannel(config = {}, deps) {
   /**
    * Deliver one payload as a Windows toast. Success is silent; failures
    * (powershell.exe missing, script error, Focus Assist) are warned and
-   * swallowed — notifications must never break the host session.
+   * swallowed — notifications must never break the host session. The
+   * outcome is RETURNED as `{ok, detail}` for the settings-page test button;
+   * the regular dispatch path ignores it.
    *
    * @param {{ title?: string, body?: string, event?: string }} [payload]
-   * @returns {Promise<void>}
+   * @returns {Promise<{ok: boolean, detail: string}>}
    */
   async function send(payload = {}) {
-    if (config.enabled === false) return;
+    if (config.enabled === false) {
+      return { ok: false, detail: "desktop channel is disabled" };
+    }
 
     // index.mjs normally pre-formats title/body; fall back to the event
     // mapping so channels stay usable standalone (self-test.mjs).
@@ -197,8 +201,11 @@ export function createChannel(config = {}, deps) {
         "-Command",
         script,
       ]);
+      return { ok: true, detail: "" };
     } catch (error) {
-      logger.warn(`[task-notify] Windows toast failed: ${describeError(error)}`);
+      const cause = describeError(error);
+      logger.warn(`[task-notify] Windows toast failed: ${cause}`);
+      return { ok: false, detail: cause };
     }
   }
 
