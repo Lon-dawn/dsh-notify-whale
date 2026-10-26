@@ -1,13 +1,14 @@
 {
   "name": "dsh-notify-whale",
-  "version": "0.6.1",
-  "description": "鲸吟（dsh-notify-whale）：DSH 通知插件加固 fork。修复上游在 Node 22/24 上 HTTP 通道完全无法投递等 5 个必现 bug；新增「等待审批/提问也通知」与事件级 Bark 铃声。AI 主导修改。(Hardened fork of dsh-task-notify.)",
+  "version": "0.6.2",
+  "description": "鲸吟通知（dsh-notify-whale）：会话完成、出错、等待审批或提问时推送到手机（Bark / ntfy / Server酱）与桌面，点通知直达会话。",
   "type": "module",
   "main": "index.mjs",
   "exports": {
     ".": "./index.mjs",
     "./client": "./client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
   },
   "files": [
     "index.mjs",
@@ -24,6 +25,7 @@
     "scripts/install-smoke.sh",
     "channels/",
     "assets/",
+    "locale/",
     "cordis.patch.yml",
     "README.md",
     "SPEC.md"

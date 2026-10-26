@@ -98,7 +98,7 @@
 ## 安装
 
 ```bash
-dsh plugin --profile web add dsh-notify-whale
+dsh plugin --profile web add github:Lon-dawn/dsh-notify-whale
 ```
 
 装完 **重启 DSH**。之后改配置在设置页里改，**立即生效、不用再重启**。
@@ -106,6 +106,32 @@ dsh plugin --profile web add dsh-notify-whale
 从本地目录安装：`dsh plugin --profile web add /path/to/dsh-notify-whale`。此时 pnpm 以 `link:` 方式接入、**不会**给被链接目录装依赖，需在插件目录里单独执行一次 `npm install --omit=dev`（否则报 `ERR_MODULE_NOT_FOUND: js-yaml` 或 `@deepseek-ai/schemastery`）。用 npm 安装没有这个问题。
 
 > 若 pnpm 报 `minimumReleaseAge` 供应链策略拦截（v11 内置默认），命令末尾追加 `--config.minimum-release-age=0` 按次放行。
+
+### 升级
+
+DSH 没有原地升级：**先卸载、再装**。配置不会丢。
+
+```bash
+dsh plugin --profile web remove dsh-notify-whale
+dsh plugin --profile web add github:Lon-dawn/dsh-notify-whale
+```
+
+配置不在插件目录里，而在 profile 的用户层
+`~/.dsh/profiles/<profile>/cordis.patch.yml` 里那行
+`- id: task-notify` / `name: dsh-notify-whale` 的 `config:` 下。卸载只改
+`package.json` 的 `dsh.profile.bundles` 和 `node_modules`，**不碰该文件**；卸载期间它会
+变成一条 `patch: entry "task-notify" not found` 的启动告警（不影响启动），重装后同 id
+同 name 自动重新接上，配置原样生效。
+
+升级前想留后路，把那个文件复制一份即可：
+
+```bash
+cp ~/.dsh/profiles/web/cordis.patch.yml ~/.dsh/profiles/web/cordis.patch.yml.bak-$(date +%Y%m%d-%H%M%S)
+```
+
+> 若之前用**单个插件行的开关**禁用过本插件，那个 `disabled: true` 是写在 patch 里的，
+> 卸载不清除——重装后是禁用态，手动打开即可。同理，Bark deviceKey / ntfy token 等
+> 凭据也随 config 原样保留（不会被清除）。
 
 ---
 

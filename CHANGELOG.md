@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.2
+
+- 插件列表/详情里的显示文案改为「鲸吟通知」+ 一句话功能描述。此前 DSH 直接显示 `package.json` 的 `description`，写的是「修复了哪 5 个必现 bug」「AI 主导修改」这类实现细节——在插件列表里看不出这个插件到底干什么。现在改由 `locale/zh.json`、`locale/en.json` 的 `meta.title` / `meta.description` 提供（DSH 的 `readPluginMeta` 读 `<包名>/locale/*.json`，文件名即语言 id），`package.json` 的 `description` 只留给 GitHub、包管理器等外部界面。
+- `package.json` 的 `exports` 增加 `"./locale/*.json"`。DSH 用 Node 解析器读这个资源，没声明导出会得到 `ERR_PACKAGE_PATH_NOT_EXPORTED`，而 `optionalResourcePath` 把它当作「没有元数据」静默回退到包名——不报错，只是文案不生效，很难发现。
+- README 安装命令改为可用的 `github:Lon-dawn/dsh-notify-whale`（裸包名在 npm 上不存在，会 404），并新增「升级」一节：DSH 没有原地升级，需卸载重装；配置存在 profile 的 `cordis.patch.yml` 用户层，卸载不碰它，重装后自动接回。
+
 ## 0.6.1
 
 - 修「发送测试通知」在手机上已收到、设置页却报「未收到发送结果——请确认插件已加载、配置可写。」（20s 超时）。根因是 HMR 事务嵌套：客户端点按钮 → 宿主 `SettingsForms.mutate` → `configEditor.edit` → `hmr.runExclusive` → `entry.update` → Loader `_commitVolatile` 在**事务内部同步**广播 `loader/volatile-update`；插件在该回调里写回 `testResult` 又要走 `hmr.runExclusive`，撞上 `HMR transactions cannot be nested`（`dsh-hmr/lib/index.js:749`）被拒，于是请求字段 `test.<channel>` 永久残留、`testResult` 永不出现。修法：用 `AsyncResource.bind` 在 `apply()`（事务外）创建调度器，把消费测试请求的动作排到事务之外执行（`Promise.then` / `setImmediate` / `setTimeout` 都会继承 AsyncLocalStorage 上下文，实测无效）。另加瞬时错误（嵌套 / 写锁超时）有限重试，避免并发写 patch 时偶发丢结果。

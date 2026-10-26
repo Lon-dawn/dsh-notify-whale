@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Whale Song Notifications",
+    "description": "Pushes session completion, errors, pending approvals and questions to your phone (Bark / ntfy / ServerChan) and desktop; click a notification to open its session."
+  }
+}
