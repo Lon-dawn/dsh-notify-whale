@@ -778,3 +778,73 @@ test('回归：非瞬时错误不重试，只 warn 一次', async () => {
   assert.equal(attempts, 1, '配置类错误重试也没用，应只尝试一次');
   assert.ok(ctx.logs.warn.some((msg) => msg.includes('测试结果写回失败')));
 });
+
+test('回归：inject 回调早于服务就绪时，稍后就绪的服务仍能用（服务必须延迟读取）', async () => {
+  const ctx = makeFakeCtx();
+  const mutations = [];
+  // 复刻 cordis 的属性代理：服务所属 fiber 尚未 active 时读出来是 undefined。
+  // 见 cordis/lib/index.js:763-771 —— `if (strict && impl.fiber.state !== 2) return;`
+  const scope = { settings: undefined };
+  ctx.inject = (names, callback) => {
+    const child = Object.create(ctx);
+    for (const serviceName of names) {
+      Object.defineProperty(child, serviceName, {
+        configurable: true,
+        get: () => scope[serviceName],
+      });
+    }
+    // 关键：注入回调此刻触发，而服务还没就绪（真实宿主里确实可能如此）。
+    callback(child);
+  };
+
+  const nonce = `${Date.now().toString(36)}-lazy1`;
+  const sent = [];
+  apply(ctx, {}, {
+    config: fullConfig({ test: { bark: JSON.stringify({ ts: Date.now(), n: nonce }) } }),
+    createChannels: () => [{ name: 'bark', send: async (payload) => { sent.push(payload); return { ok: true, detail: 'HTTP 200' }; } }],
+  });
+
+  // 服务在插件已挂载之后才就绪。
+  scope.settings = { mutate: async (ns, ops) => { mutations.push({ ns, ops }); } };
+
+  ctx.emit('loader/volatile-update');
+  // 服务就绪但仍要经过 150/600ms 的重试窗口。
+  await new Promise((resolve) => { setTimeout(resolve, 1200); });
+
+  assert.equal(sent.length, 1, '通知应当照常发出');
+  assert.equal(mutations.length, 1, '延迟读取让晚就绪的服务也能写回');
+  const set = mutations[0].ops.find((op) => op.op === 'set');
+  assert.deepEqual(set.path, ['testResult']);
+  assert.equal(JSON.parse(set.value)[nonce].ok, true);
+});
+
+test('回归：inject 回调读出 undefined 时不得把「还没就绪」误判为「永远没有服务」', async () => {
+  const ctx = makeFakeCtx();
+  const mutations = [];
+  // 与上一条的区别：服务**始终**不存在。此时应经有界重试后降级为 warn，而不是无限等。
+  ctx.inject = (names, callback) => {
+    const child = Object.create(ctx);
+    for (const serviceName of names) {
+      Object.defineProperty(child, serviceName, { configurable: true, get: () => undefined });
+    }
+    callback(child);
+  };
+
+  const nonce = `${Date.now().toString(36)}-lazy2`;
+  const sent = [];
+  apply(ctx, {}, {
+    config: fullConfig({ test: { bark: JSON.stringify({ ts: Date.now(), n: nonce }) } }),
+    createChannels: () => [{ name: 'bark', send: async (payload) => { sent.push(payload); return { ok: true, detail: '' }; } }],
+  });
+
+  ctx.emit('loader/volatile-update');
+  // 重试窗口是 150ms + 600ms；给足时间，验证它最终放弃而不是永远挂着。
+  await new Promise((resolve) => { setTimeout(resolve, 1200); });
+
+  assert.equal(sent.length, 1, '通知照常发出，用户仍能收到推送');
+  assert.equal(mutations.length, 0);
+  assert.ok(
+    ctx.logs.warn.some((msg) => msg.includes('测试结果写回失败')),
+    `应当在有界重试后 warn 写回失败，实际警告：${JSON.stringify(ctx.logs.warn)}`,
+  );
+});

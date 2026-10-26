@@ -3,7 +3,8 @@
 ## 0.6.1
 
 - 修「发送测试通知」在手机上已收到、设置页却报「未收到发送结果——请确认插件已加载、配置可写。」（20s 超时）。根因是 HMR 事务嵌套：客户端点按钮 → 宿主 `SettingsForms.mutate` → `configEditor.edit` → `hmr.runExclusive` → `entry.update` → Loader `_commitVolatile` 在**事务内部同步**广播 `loader/volatile-update`；插件在该回调里写回 `testResult` 又要走 `hmr.runExclusive`，撞上 `HMR transactions cannot be nested`（`dsh-hmr/lib/index.js:749`）被拒，于是请求字段 `test.<channel>` 永久残留、`testResult` 永不出现。修法：用 `AsyncResource.bind` 在 `apply()`（事务外）创建调度器，把消费测试请求的动作排到事务之外执行（`Promise.then` / `setImmediate` / `setTimeout` 都会继承 AsyncLocalStorage 上下文，实测无效）。另加瞬时错误（嵌套 / 写锁超时）有限重试，避免并发写 patch 时偶发丢结果。
-- 新增 3 个回归测试：真实模拟 `AsyncLocalStorage` 事务守卫，验证「事务内触发 volatile-update 仍能写回」「瞬时错误会重试」「配置类错误不重试」。已用反向验证确认：移除修复后首个测试即失败。
+- 新增 5 个回归测试：真实模拟 `AsyncLocalStorage` 事务守卫与 cordis 的属性代理，验证「事务内触发 volatile-update 仍能写回」「瞬时错误会重试」「配置类错误不重试」「晚就绪的 settings 服务仍能用」「服务始终缺失时有界放弃」。两条关键用例均已反向验证：把修复退回旧写法，对应用例立即失败。
+- 顺带加固：`settings` 服务改为**每次用时再取**，不再在 `ctx.inject` 回调里缓存引用。cordis 属性代理在服务所属 fiber 尚未 active 时返回 `undefined`（`cordis/lib/index.js:763-771`），而 inject 回调的触发时机不保证服务已就绪——早触发一次就会永久拿到 `null`，症状与本次真正的 bug 完全一样（手机收到了、设置页 20s 超时）。延迟读取让服务一旦就绪就自愈。
 
 ## 0.6.0
 

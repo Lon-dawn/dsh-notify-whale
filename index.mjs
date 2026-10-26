@@ -73,6 +73,45 @@ const TEST_RESULT_KEEP = 8;
 const TEST_RESULT_TTL_MS = 10 * 60_000;
 
 /**
+ * 把回调「逃逸」出触发它的那个 AsyncLocalStorage 上下文再执行。
+ *
+ * ── 为什么必须这样做（v0.6.1 修复，实测复现）───────────────────────────
+ * 客户端点「发送测试通知」时，宿主链路是：
+ *   SettingsForms.mutate → configEditor.edit → **hmr.runExclusive(run)**
+ *     → reconcileProfilePatches → entry.update → Loader._commitVolatile
+ *       → **同步 emit('loader/volatile-update')** ← 我们在这里被调用
+ * 也就是说，本插件收到 volatile-update 的那一刻，**正处在 HMR 写事务内部**。
+ * 而写回测试结果走的 settings.mutate 最终同样要 `hmr.runExclusive`，于是：
+ *   `HMR transactions cannot be nested`（dsh-hmr/lib/index.js:749）
+ * 结果就是「手机收到了，设置页却 20s 超时」——请求字段 `test.<channel>`
+ * 永远留在 patch 里，`testResult` 永远不出现。
+ *
+ * ── 为什么 Promise.then / setTimeout / setImmediate 都不管用 ──────────
+ * AsyncLocalStorage 的上下文会随 Promise 链与定时器**一起传递**（实测
+ * Promise.then、setImmediate、setTimeout、setInterval 四种全都在事务内）。
+ * 唯一可靠的手段是用 `AsyncResource.bind` 在**没有任何事务活跃的时机**
+ * 创建绑定，绑出来的调度器因此携带空上下文，每次调用都从干净栈出发。
+ *
+ * ⚠️ 因此这里**在模块作用域**创建，而不是在 apply() 里：模块的作用域每一进程
+ * 只求值一次，必然是干净的；若放进 apply()，当插件行本身就是在某次 HMR
+ * 事务里被挂载时（重装插件、profile 重算），bind 会继承那次事务的上下文，
+ * 修复静默失效。这是刻意选择的更保守位置，不要挪回 apply()。
+ */
+const scheduleOutsideHmrTransaction = AsyncResource.bind(
+  (fn) => {
+    setImmediate(() => {
+      try {
+        const result = fn();
+        if (result && typeof result.then === 'function') {
+          result.then(null, () => {});
+        }
+      } catch {}
+    });
+  },
+  'task-notify/escape-hmr-transaction',
+);
+
+/**
  * 0.1.7 settings schema. `@deepseek-ai/dsh-settings` treats an entry as
  * configurable only when `entry.fiber.runtime.Config` exists and carries at
  * least one volatile field; the volatile ones are handed to {@link apply} as
@@ -219,47 +258,8 @@ export function apply(ctx, input = {}, overrides = {}) {
   };
 
   /**
-   * 把回调「逃逸」出触发它的那个 AsyncLocalStorage 上下文再执行。
-   *
-   * ── 为什么必须这样做（v0.6.1 修复，实测复现）───────────────────────────
-   * 客户端点「发送测试通知」时，宿主链路是：
-   *   SettingsForms.mutate → configEditor.edit → **hmr.runExclusive(run)**
-   *     → reconcileProfilePatches → entry.update → Loader._commitVolatile
-   *       → **同步 emit('loader/volatile-update')** ← 我们在这里被调用
-   * 也就是说，本插件收到 volatile-update 的那一刻，**正处在 HMR 写事务内部**。
-   * 而写回测试结果走的 settings.mutate 最终同样要 `hmr.runExclusive`，于是：
-   *   `HMR transactions cannot be nested`（dsh-hmr/lib/index.js:749）
-   * 结果就是「手机收到了，设置页却 20s 超时」——请求字段 `test.<channel>`
-   * 永远留在 patch 里，`testResult` 永远不出现。
-   *
-   * ── 为什么 Promise.then / setTimeout / setImmediate 都不管用 ──────────
-   * AsyncLocalStorage 的上下文会随 Promise 链与定时器**一起传递**（实测
-   * Promise.then、setImmediate、setTimeout、setInterval 四种全都在事务内）。
-   * 唯一可靠的手段是用 `AsyncResource.bind` 在**事务外**创建绑定：本函数在
-   * `apply()` 里执行，那时还没有任何 HMR 事务，bind 出来的调度器因此携带
-   * 空上下文，每次调用都从干净栈出发。
-   *
-   * 顺带一提，这也解释了为什么「配置热更新生效了、但结果写不回去」——
-   * 二者共用同一个 volatile-update 入口，前者不需要写回所以正常。
-   *
-   * @param {Function} fn 要在事务外执行的函数
-   */
-  const scheduleOutsideHmrTransaction = AsyncResource.bind(
-    (fn) => {
-      setImmediate(() => {
-        try {
-          const result = fn();
-          if (result && typeof result.then === 'function') {
-            result.then(null, () => {});
-          }
-        } catch {}
-      });
-    },
-    'task-notify/escape-hmr-transaction',
-  );
-
-  /**
    * 在事务外处理测试请求（fire-and-forget，绝不影响 volatile-update 的返回）。
+   * 调度器本身定义在**模块作用域**（见其注释：必须在无事务时创建 bind）。
    */
   function scheduleTestProcessing() {
     scheduleOutsideHmrTransaction(() => processTestRequests());
@@ -308,18 +308,47 @@ export function apply(ctx, input = {}, overrides = {}) {
    * 0.1.7 语义一致。
    */
 
-  /** settings 服务（每插件实例一份）：写回测试结果用。缺失时降级为「只发不回报」。 */
-  let settingsService = null;
+  /**
+   * settings 服务（每插件实例一份）：写回测试结果用。缺失时降级为「只发不回报」。
+   *
+   * 存的是**注入得到的子作用域**，不是服务本身——服务必须**每次用时再取**。
+   * cordis 的属性代理在服务所属 fiber 尚未 active 时返回 undefined
+   * （`cordis/lib/index.js:763-771`：`if (strict && impl.fiber.state !== 2) return;`），
+   * 而 inject 回调的触发时机不保证服务已就绪。若在回调里缓存 `child.settings`，
+   * 早触发一次就会永久拿到 null，症状与真正的原因（写回被拒）完全一样：
+   * 手机收到了通知、设置页 20s 超时、文档里 test.<channel> 永久残留。
+   * 延迟读取让每次写回都重新探测，服务一旦就绪就自愈。
+   */
+  let settingsScope = null;
   if (typeof ctx.inject === 'function') {
     try {
       // 与官方插件同款用法（如 dsh-client-locale）：子作用域里 settings 即本插件
       // 自己的 SettingsForms，可写本 entry 的 volatile 字段。
       ctx.inject(['settings'], (child) => {
-        settingsService = child?.settings ?? null;
+        settingsScope = child ?? null;
+        // 服务此刻可能还没就绪，所以这里只作探测记录，不作为「永远没有服务」的依据。
+        if (child?.settings == null) {
+          logger.info('[task-notify] settings 服务尚未就绪，测试结果写回将在稍后重试');
+        }
       });
     } catch (error) {
       logger.warn(`[task-notify] settings 服务注入失败，测试通知将无法回报结果：${describe(error)}`);
     }
+  }
+
+  /**
+   * 取当前可用的 settings 服务；未就绪或缺少 mutate 时返回 null。
+   * @returns {{mutate: Function} | null}
+   */
+  function getSettingsService() {
+    let service = null;
+    try {
+      service = settingsScope?.settings ?? null;
+    } catch {
+      // 服务所在 fiber 已销毁时属性代理会抛，按不可用处理。
+      service = null;
+    }
+    return service && typeof service.mutate === 'function' ? service : null;
   }
 
   /** 已处理过的 nonce → 时间；防止重复派发（我们自己写回结果也会触发 volatile-update）。 */
@@ -484,12 +513,24 @@ export function apply(ctx, input = {}, overrides = {}) {
 
   /**
    * 写回测试结果，瞬时错误自动重试。
+   *
+   * 服务在**每次尝试时重新取**：除了避开「注入回调早于服务就绪」的陷阱
+   * （见 settingsScope 的注释），也让宿主重启 settings 服务后无需重挂插件。
    * @param {{op: string, path: string[], value?: unknown}[]} ops 配置写操作
    */
   async function mutateWithRetry(ops) {
     for (let attempt = 0; ; attempt += 1) {
+      const service = getSettingsService();
+      if (service === null) {
+        // 服务还没就绪：当作瞬时错误重试，重试用尽后由调用方降级为 warn。
+        if (attempt >= WRITE_RETRY_DELAYS_MS.length) {
+          throw new Error('settings 服务不可用（尚未就绪）');
+        }
+        await new Promise((resolve) => { setTimeout(resolve, WRITE_RETRY_DELAYS_MS[attempt]); });
+        continue;
+      }
       try {
-        await settingsService.mutate(name, ops);
+        await service.mutate(name, ops);
         return;
       } catch (error) {
         if (attempt >= WRITE_RETRY_DELAYS_MS.length || !isTransientWriteError(error)) throw error;
@@ -514,7 +555,9 @@ export function apply(ctx, input = {}, overrides = {}) {
       })),
     );
 
-    if (!settingsService || typeof settingsService.mutate !== 'function') {
+    // 完全没有注入到 settings（宿主没挂这个服务、或插件层级不对）：直接降级，
+    // 不要白等重试——这种情况下等下去也不会有服务出现。
+    if (settingsScope === null) {
       const sent = outcomes.filter((item) => item.outcome !== null);
       if (sent.length > 0) {
         logger.warn('[task-notify] settings 服务不可用，测试通知已发送但结果无法写回设置页');
